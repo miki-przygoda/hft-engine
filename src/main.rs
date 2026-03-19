@@ -37,7 +37,7 @@ fn main() {
 
     println!("-------------------------------------");
     println!("Total Time:   {:?}", duration);
-    println!("Thruput:      {:.2} Billion Ops/sec", (total_ops / 1e9) / duration.as_secs_f64());
+    println!("Throughput:      {:.2} Billion Ops/sec", (total_ops / 1e9) / duration.as_secs_f64());
     println!("1M Ops Time:  {:.4} ns", (duration.as_nanos() as f64 / total_ops) * 1_000_000.0);
 }
 
