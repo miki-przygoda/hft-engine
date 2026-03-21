@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 const ITERATIONS_PER_THREAD: usize = 1_000_000_000;
 
-fn multi_threaded() {
+fn main() {
     let num_cores = thread::available_parallelism().unwrap().get();
     println!("--- M3 Max 'The Kraken' Multi-Threaded Probe ---");
     println!("Detected Cores: {}", num_cores);
