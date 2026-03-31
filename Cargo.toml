@@ -3,4 +3,16 @@ name = "rust-hft-software"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "trading-engine"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench-one-threaded"
+path = "src/testing_scripts/one_threaded.rs"
+
+[[bin]]
+name = "bench-multi-threaded"
+path = "src/testing_scripts/multi_threaded.rs"
+
 [dependencies]

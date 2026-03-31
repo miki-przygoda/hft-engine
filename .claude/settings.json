@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/update_file_map.sh",
+            "timeout": 10,
+            "statusMessage": "Checking CLAUDE.md file map..."
+          }
+        ]
+      }
+    ]
+  }
+}
