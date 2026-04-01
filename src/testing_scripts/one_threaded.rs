@@ -18,7 +18,9 @@ enum ComputeMode {
 
 fn main() {
     println!("--- Cross-Platform Hardware Bench ---");
-
+    if let ComputeMode::Scalar = ComputeMode::Scalar {
+        println!("Warning: No SIMD support detected, running in scalar mode. Performance will be very low.");
+    }
     let mode = select_mode();
 
     #[cfg(target_arch = "aarch64")]
@@ -76,21 +78,6 @@ fn select_mode() -> ComputeMode {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         ComputeMode::Scalar
-    }
-}
-
-#[inline(always)]
-fn mode_name(mode: ComputeMode) -> &'static str {
-    match mode {
-        #[cfg(target_arch = "x86_64")]
-        ComputeMode::Avx512 => "AVX-512 512-bit",
-        #[cfg(target_arch = "x86_64")]
-        ComputeMode::Avx2 => "AVX2 256-bit",
-        #[cfg(target_arch = "x86_64")]
-        ComputeMode::Sse => "SSE 128-bit",
-        #[cfg(target_arch = "aarch64")]
-        ComputeMode::Neon => "NEON 128-bit",
-        ComputeMode::Scalar => "Scalar fallback",
     }
 }
 
