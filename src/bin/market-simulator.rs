@@ -2,8 +2,7 @@ use std::net::UdpSocket;
 use std::thread;
 use std::time::Duration;
 
-const WARMUP_PACKETS: u64 = 10;
-const REAL_PACKETS: u64 = 40;
+use rust_hft_software::config::{WARMUP_PACKETS, REAL_PACKETS, INGESTOR_ADDR, PACKET_INTERVAL_MS};
 
 fn main() {
     let socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to create UDP socket");
@@ -22,20 +21,20 @@ fn main() {
         packet.extend_from_slice(&price.to_le_bytes());
         packet.extend_from_slice(&volume.to_le_bytes());
         packet.extend_from_slice(&sequence.to_le_bytes());
-        socket.send_to(&packet, "127.0.0.1:34254").expect("Failed to send warmup packet");
+        socket.send_to(&packet, INGESTOR_ADDR).expect("Failed to send warmup packet");
     }
 
     // Brief gap so the engine drains all warmup ticks before real traffic starts.
     thread::sleep(Duration::from_millis(50));
 
-    // Real trading phase: REAL_PACKETS at 50 ms intervals.
+    // Real trading phase: REAL_PACKETS at PACKET_INTERVAL_MS intervals.
     for i in 0..REAL_PACKETS {
         let sequence = WARMUP_PACKETS + 1 + i;
         let mut packet = Vec::new();
         packet.extend_from_slice(&price.to_le_bytes());
         packet.extend_from_slice(&volume.to_le_bytes());
         packet.extend_from_slice(&sequence.to_le_bytes());
-        socket.send_to(&packet, "127.0.0.1:34254").expect("Failed to send packet");
-        thread::sleep(Duration::from_millis(50));
+        socket.send_to(&packet, INGESTOR_ADDR).expect("Failed to send packet");
+        thread::sleep(Duration::from_millis(PACKET_INTERVAL_MS));
     }
 }

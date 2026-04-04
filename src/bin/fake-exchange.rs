@@ -16,9 +16,7 @@
 //   bytes 16–23  order_send_ns u64
 
 use std::net::UdpSocket;
-
-const LISTEN_ADDR:  &str = "127.0.0.1:34255";
-const CONFIRM_ADDR: &str = "127.0.0.1:34256";
+use rust_hft_software::config::{ORDER_ADDR, CONFIRM_ADDR, MIN_ORDER_PACKET_SIZE};
 
 unsafe extern "C" {
     fn pthread_set_qos_class_self_np(qos: u32, relpri: i32) -> i32;
@@ -30,7 +28,7 @@ fn main() {
     // be starved behind lower-priority work, adding scheduling jitter.
     unsafe { pthread_set_qos_class_self_np(0x21, 0); }
 
-    let socket = UdpSocket::bind(LISTEN_ADDR)
+    let socket = UdpSocket::bind(ORDER_ADDR)
         .expect("fake-exchange: failed to bind on 34255");
     socket.set_nonblocking(true)
         .expect("fake-exchange: failed to set non-blocking");
@@ -39,7 +37,7 @@ fn main() {
 
     loop {
         match socket.recv_from(&mut buf) {
-            Ok((amt, _)) if amt >= 24 => {
+            Ok((amt, _)) if amt >= MIN_ORDER_PACKET_SIZE => {
                 // Real order — echo immediately to engine confirm socket.
                 let _ = socket.send_to(&buf[..amt], CONFIRM_ADDR);
             }
