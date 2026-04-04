@@ -22,3 +22,7 @@ Cargo.lock
 
 
 logs/
+
+# MacOS:
+
+.DS_Store

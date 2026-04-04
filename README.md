@@ -18,7 +18,22 @@ Five structs with aggressive memory layout control:
 
 - **`TradeLog`** — lock-free single-writer trade log backed by `UnsafeCell<[TradeExecution; 1024]>` + an `AtomicU64` write cursor. The strategy writes all fields then does `fetch_add(1, Release)` to commit. The stats thread reads with `load(Acquire)`. No mutex, no heap allocation in the hot path.
 
-- **`OrderBook`** — holds `buy_count: AtomicU64` and the `TradeLog`. The `start_time` that was previously here has been moved into `RingBuffer` for the cache co-location optimization above.
+- **`OrderBook`** — holds the `TradeLog`. Cache-line aligned with `#[repr(C, align(64))]`.
+
+- **`OrderRing`** — lock-free SPSC ring connecting the strategy thread to the in-process exchange. Each `OrderEntry` carries sequence, trade log slot index, and `order_send_ns`.
+
+### Engine (`src/engine.rs`)
+
+All runtime logic lives here. Six functions:
+
+| Function | Role |
+|----------|------|
+| `run_ingestor` | Binds UDP port 34254, spin-polls, writes ticks into the ring buffer |
+| `run_in_process_exchange` | Consumes `OrderRing` entries, writes `round_trip_ns` back to the trade log |
+| `run_watchdog` | 500ms poll loop — shuts down after 10s idle or 30s with no feed |
+| `run_market_simulator` | Internal simulator — sends 10 warmup + 100 real UDP packets |
+| `trading_strategy` | Hot path — NEON warmup, spin-poll, signal logic, trade log write |
+| `print_stats` / `write_log` | Print latency report to stdout and save JSON to disk |
 
 ### Trading strategy (`src/main.rs`)
 
@@ -26,37 +41,46 @@ Five threads with clearly separated responsibilities:
 
 | Thread | Role | Priority |
 |--------|------|----------|
-| Main | Trading strategy — the hot path | `QOS_USER_INTERACTIVE` |
+| Watchdog | Idle detection and shutdown | default |
+| Exchange | In-process order confirmation | `QOS_USER_INTERACTIVE` |
 | Ingestor | UDP receive → ring buffer write | `QOS_USER_INTERACTIVE` |
-| Confirm receiver | Exchange ack → trade log round-trip write | engine process |
-| Heartbeat | Keep exchange path warm | default |
-| Stats monitor | Print latency report after execution | default |
+| Simulator | Internal market data source | default |
+| Strategy | Trading hot path | `QOS_USER_INTERACTIVE` |
+
+The strategy thread spins on two `Arc<AtomicBool>` greenlights (ingestor ready + exchange ready) before entering the trading loop. The main thread joins the strategy thread and blocks until the watchdog calls `process::exit`.
 
 **Hot path design:**
 - **NEON warmup** — 10,000 `fmul v0.4s` operations + `elapsed()` calls before entering the loop. Warms vector execution units, pulls code into L1 instruction cache, and commits OS pages for the trade log array (avoiding page faults on first write).
 - **Spin-poll** — tight `load(Acquire)` loop with `spin_loop()` (YIELD on ARM64) in the idle branch. No blocking, no condvars.
 - **PRFM prefetch** — idle branch emits `PRFM PSTL1KEEP` for the next trade log slot, fetching it into L1 in exclusive (store-ready) state before the next tick arrives.
-- **Lock-free trade log** — replaced the original `Mutex<Vec<TradeExecution>>` with the `TradeLog` ring. Eliminated mutex acquisition from the hot path entirely.
-- **Warmup packets** — the first 10 sequence numbers are treated as warmup. The strategy runs the full hot path (NEON asm, elapsed, lock-free write path) but does not commit to the trade log. This trains the branch predictor and warms all hot-path cache lines before real measurement begins.
+- **`black_box` hints** — warmup loop outputs and the branchless trigger expression are wrapped in `black_box` to prevent the compiler from eliminating or transforming them.
+- **Branchless trigger** — `(black_box(decision) | (current_seq & 1)) != 0` replaces short-circuit `||` to remove the branch predictor dependency.
+- **Page pre-touch** — all three shared buffers (`RingBuffer`, `OrderRing`, `TradeLog`) are written with `write_volatile` before any threads are spawned, committing OS pages up front and eliminating demand-paging faults during trading.
+- **Warmup packets** — the first 10 sequence numbers are treated as warmup. The strategy runs the full hot path but does not commit to the trade log.
 
-**Round-trip path:**
-- Strategy commits the trade log entry, then sends a 24-byte UDP order packet to the fake exchange (port 34255). The packet carries sequence, trade log slot index, and `order_send_ns`.
-- A dedicated heartbeat thread sends 1-byte packets to the exchange every 1ms, keeping the exchange process awake and the kernel networking path warm between real orders.
-- The fake exchange spin-polls port 34255 at `QOS_USER_INTERACTIVE`. Real orders (≥ 24 bytes) are echoed immediately to port 34256. Heartbeats (< 24 bytes) are discarded.
-- The confirm receiver spin-polls port 34256. On receipt it reads `confirm_recv_ns`, looks up the trade log slot directly (no scan — slot index is in the packet), and writes `round_trip_ns`.
+**Round-trip path (in-process):**
+- Strategy writes a completed `TradeExecution` to the trade log, then pushes an `OrderEntry` (sequence + slot + `order_send_ns`) onto the `OrderRing`.
+- The exchange thread spin-polls the `OrderRing`, reads `confirm_recv_ns` via `elapsed()`, and writes `round_trip_ns = confirm_recv_ns - order_send_ns` directly into the trade log slot.
+- No kernel boundary crossings — the entire round trip is userspace shared memory.
 
-### Market simulator (`src/bin/market-simulator.rs`)
+### Standalone binaries (`src/bin/`)
 
-Sends packets in two phases:
-1. **Warmup phase** — 10 packets with no inter-packet delay. These exercise the full hot path in the engine to warm caches and the branch predictor without polluting the latency measurements.
-2. **Real trading phase** — 40 packets at 50ms intervals. Triggers fire on odd sequence numbers (sequences 11, 13, 15, … 49), producing 20 recorded trades.
+These exist for external testing and are not required for the standard run:
 
-### Fake exchange (`src/bin/fake-exchange.rs`)
+**`fake-exchange`** — binds port 34255, spin-polls at `QOS_USER_INTERACTIVE`, echoes real order packets (≥ 24 bytes) to port 34256, discards heartbeats.
 
-Simulates the matching engine side of the round-trip:
-- Binds to port 34255, spin-polls with `QOS_USER_INTERACTIVE`.
-- Real order packets (24 bytes) are echoed immediately to port 34256.
-- Heartbeat packets (< 24 bytes) are discarded — they exist only to keep the process awake and the kernel path warm.
+**`market-simulator`** — sends 10 warmup + 100 real UDP packets to port 34254 with a configurable inter-packet interval.
+
+### Run logging
+
+After each run, the engine writes a JSON file to:
+```
+logs/v{version}/{date}/{HH-MM-SS}.json
+```
+
+Example: `logs/v0.1.1/2026-04-04/22-07-35.json`
+
+The file contains version, timestamp, aggregate stats (avg/min/max for both signal latency and round trip), and the full per-trade record. Version is read from `Cargo.toml` at compile time via `env!("CARGO_PKG_VERSION")`.
 
 ### Benchmarking suite (`src/testing_scripts/`)
 
@@ -69,12 +93,13 @@ Simulates the matching engine side of the round-trip:
 ## Architecture decisions
 
 - **Zero external dependencies.** Everything is std + inline assembly.
+- **Self-contained simulation.** The `trading-engine` binary spawns the market simulator and in-process exchange internally — no separate processes required.
 - **Cache-line alignment everywhere.** `#[repr(C, align(64))]` on all structs that cross thread boundaries.
-- **Atomics over mutexes.** The ring buffer, trade log, and buy counter all use atomics. No lock contention in the hot path.
+- **Atomics over mutexes.** The ring buffer, trade log, and order ring all use atomics. No lock contention in the hot path.
 - **`start_time` co-located with `latest_idx`** in `RingBuffer`. The spin-poll loop reads `latest_idx` on every iteration — `start_time` in the same cache line means it is always L1-hot at zero extra cost.
-- **Lock-free trade log** over `Mutex<Vec>`. The original design paid a mutex acquisition on every triggered trade. The `TradeLog` ring eliminates this.
-- **Warmup packets** over PRFM-only cache warming. PRFM is a hint the CPU can ignore. Warmup packets force the full hot path to actually execute, guaranteeing cache and branch predictor state.
-- **Spin-poll exchange + heartbeat** for round-trip measurement. Eliminates OS wakeup latency (~10–30µs per wakeup) from the exchange and confirm paths.
+- **In-process exchange** over external UDP echo. Eliminates all kernel crossings from the round-trip path, dropping round-trip from ~43–135µs to ~83–625ns.
+- **`black_box` + branchless trigger** to prevent the compiler from eliminating warmup work or transforming the hot-path branch.
+- **Power-of-2 buffer sizes** with bitmask indexing (`& MASK`) replacing `% SIZE` modulo operations.
 
 ---
 
@@ -97,39 +122,55 @@ Simulates the matching engine side of the round-trip:
 cargo build --release
 ```
 
-### Run the full simulation (signal latency + round-trip)
+### Run the full simulation
 
 ```bash
-./target/release/fake-exchange & ./target/release/trading-engine & sleep 1.5 && ./target/release/market-simulator & sleep 8 && killall trading-engine fake-exchange 2>/dev/null; sleep 0.5
+cargo run --release --bin trading-engine
 ```
 
-All three processes must be running. The fake exchange must start before the trading engine attempts to send orders.
+The binary is self-contained — it spawns the market simulator and in-process exchange internally. No external processes needed.
 
 ### Expected output
 
-The system runs silently during execution. After 5 seconds, it prints the full latency report:
-
 ```
-Total trades executed: 20
+[engine] starting — running full simulation in-process
+[engine] all systems ready — entering trading loop
+Total trades executed: 50
 
 Sequence     Sig Latency (ns)     Round Trip (ns)
 ───────────────────────────────────────────────────────
-11           208                  57625
-13           167                  44458
-15           250                  50750
-17           208                  65958
+11           583                  625
+13           125                  83
+15           167                  125
 ...
 ───────────────────────────────────────────────────────
-Signal latency — Avg:     389 ns  Min:     167 ns  Max:    1125 ns
-Round trip     — Avg:   68000 ns  Min:   43167 ns  Max:  135666 ns
+Signal latency — Avg:     214 ns  Min:      83 ns  Max:     583 ns
+Round trip     — Avg:     174 ns  Min:      83 ns  Max:     625 ns
+[log] saved → logs/v0.1.1/2026-04-04/22-07-35.json
 ```
 
 **Key metrics:**
-- **Sig Latency** — nanoseconds from packet ingest to buy signal trigger. Pure userspace: spin-poll detection + NEON asm + hardware timer read. Typical range: 125–600ns.
-- **Round Trip** — nanoseconds from order submission to confirmation received. Crosses the kernel 4 times (2 sends, 2 recvs) through macOS loopback UDP. Typical range: 43–135µs. The floor (~43µs) is the hard limit of the BSD socket layer without kernel bypass.
+- **Sig Latency** — nanoseconds from packet ingest to buy signal trigger. Pure userspace: spin-poll detection + NEON asm + hardware timer read. Typical range: 83–600ns.
+- **Round Trip** — nanoseconds from order submission to in-process confirmation. Entirely userspace shared memory — no syscalls. Typical range: 83–625ns.
 
-**Why the ~163x ratio between signal latency and round trip:** signal latency is entirely in userspace (no syscalls). Round trip mandatorily crosses EL0→EL1 four times plus two process wakeups — categorically different operations.
+### Run the standalone binaries (optional)
+
+```bash
+# External exchange + engine + simulator (three-process mode)
+./target/release/fake-exchange &
+./target/release/trading-engine &
+./target/release/market-simulator
+```
+
+In three-process mode the round trip crosses kernel UDP boundaries, producing latencies in the 43–135µs range.
+
+### Run benchmarks
+
+```bash
+cargo run --release --bin bench-one-threaded
+cargo run --release --bin bench-multi-threaded
+```
 
 ### Platform requirements
 
-Requires macOS on Apple Silicon for `pthread_set_qos_class_self_np` and the ARM64 NEON inline assembly in `main.rs` and `multi_threaded.rs`.
+Requires macOS on Apple Silicon for `pthread_set_qos_class_self_np` and the ARM64 NEON inline assembly in `engine.rs` and `multi_threaded.rs`.
