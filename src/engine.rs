@@ -5,7 +5,7 @@ use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::{models, BUFFER_SIZE, ORDER_RING_SIZE, TRADE_LOG_SIZE};
 use rust_hft_software::config::{INGESTOR_ADDR, PACKET_INTERVAL_MS, REAL_PACKETS, WARMUP_PACKETS};
@@ -116,6 +116,7 @@ pub(crate) fn run_watchdog(
         }
 
         print_stats(&order_book);
+        write_log(&order_book);
         std::process::exit(0);
     }
 }
@@ -166,6 +167,118 @@ fn print_stats(order_book: &models::OrderBook) {
     }
 
     let _ = std::io::stdout().flush();
+}
+
+fn write_log(order_book: &models::OrderBook) {
+    let count  = (order_book.trade_log.write_idx.load(Ordering::Acquire) as usize).min(TRADE_LOG_SIZE);
+    let trades = unsafe { &*order_book.trade_log.entries.get() };
+
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let (date, time) = unix_to_date_time(secs);
+    let version = env!("CARGO_PKG_VERSION");
+
+    let dir = format!("logs/v{}/{}", version, date);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[log] failed to create log directory: {}", e);
+        return;
+    }
+    let path = format!("{}/{}.json", dir, time);
+
+    let mut json = String::with_capacity(4096);
+    json.push_str("{\n");
+    json.push_str(&format!("  \"version\": \"{}\",\n", version));
+    json.push_str(&format!("  \"date\": \"{}\",\n", date));
+    json.push_str(&format!("  \"timestamp\": \"{}T{}Z\",\n", date, time));
+    json.push_str(&format!("  \"total_trades\": {},\n", count));
+
+    if count > 0 {
+        let mut sig_sum  = 0u64;
+        let mut sig_min  = u64::MAX;
+        let mut sig_max  = 0u64;
+        let mut rt_sum   = 0u64;
+        let mut rt_min   = u64::MAX;
+        let mut rt_max   = 0u64;
+        let mut rt_count = 0usize;
+
+        for t in &trades[..count] {
+            sig_sum += t.latency_ns;
+            if t.latency_ns < sig_min { sig_min = t.latency_ns; }
+            if t.latency_ns > sig_max { sig_max = t.latency_ns; }
+            if t.round_trip_ns > 0 {
+                rt_sum += t.round_trip_ns;
+                if t.round_trip_ns < rt_min { rt_min = t.round_trip_ns; }
+                if t.round_trip_ns > rt_max { rt_max = t.round_trip_ns; }
+                rt_count += 1;
+            }
+        }
+
+        json.push_str("  \"signal_latency\": {\n");
+        json.push_str(&format!("    \"avg_ns\": {},\n", sig_sum / count as u64));
+        json.push_str(&format!("    \"min_ns\": {},\n", sig_min));
+        json.push_str(&format!("    \"max_ns\": {}\n", sig_max));
+        json.push_str("  },\n");
+
+        json.push_str("  \"round_trip\": {\n");
+        if rt_count > 0 {
+            json.push_str(&format!("    \"avg_ns\": {},\n", rt_sum / rt_count as u64));
+            json.push_str(&format!("    \"min_ns\": {},\n", rt_min));
+            json.push_str(&format!("    \"max_ns\": {}\n", rt_max));
+        } else {
+            json.push_str("    \"avg_ns\": null,\n");
+            json.push_str("    \"min_ns\": null,\n");
+            json.push_str("    \"max_ns\": null\n");
+        }
+        json.push_str("  },\n");
+    } else {
+        json.push_str("  \"signal_latency\": null,\n");
+        json.push_str("  \"round_trip\": null,\n");
+    }
+
+    json.push_str("  \"trades\": [\n");
+    for (i, t) in trades[..count].iter().enumerate() {
+        let rt = if t.round_trip_ns > 0 { t.round_trip_ns.to_string() } else { "null".to_string() };
+        let comma = if i + 1 < count { "," } else { "" };
+        json.push_str(&format!(
+            "    {{\"sequence\": {}, \"sig_latency_ns\": {}, \"round_trip_ns\": {}}}{}\n",
+            t.sequence, t.latency_ns, rt, comma
+        ));
+    }
+    json.push_str("  ]\n");
+    json.push_str("}\n");
+
+    match std::fs::write(&path, &json) {
+        Ok(_)  => println!("[log] saved → {}", path),
+        Err(e) => eprintln!("[log] write failed: {}", e),
+    }
+}
+
+fn unix_to_date_time(secs: u64) -> (String, String) {
+    let days_since_epoch = secs / 86400;
+    let time_of_day      = secs % 86400;
+
+    let h = time_of_day / 3600;
+    let m = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
+
+    let z       = days_since_epoch + 719468;
+    let era      = z / 146097;
+    let doe      = z - era * 146097;
+    let yoe      = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y        = yoe + era * 400;
+    let doy      = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp       = (5 * doy + 2) / 153;
+    let d        = doy - (153 * mp + 2) / 5 + 1;
+    let month    = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year     = if month <= 2 { y + 1 } else { y };
+
+    (
+        format!("{:04}-{:02}-{:02}", year, month, d),
+        format!("{:02}-{:02}-{:02}", h, m, s),
+    )
 }
 
 pub(crate) fn run_market_simulator(ingestor_ready: Arc<AtomicBool>) {

@@ -19,3 +19,6 @@ Cargo.lock
 
 # Claude Code — local-only settings (API keys, personal overrides)
 .claude/settings.local.json
+
+
+logs/
