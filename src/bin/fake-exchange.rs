@@ -18,6 +18,7 @@
 use std::net::UdpSocket;
 use rust_hft_software::config::{ORDER_ADDR, CONFIRM_ADDR, MIN_ORDER_PACKET_SIZE};
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn pthread_set_qos_class_self_np(qos: u32, relpri: i32) -> i32;
 }
@@ -26,6 +27,7 @@ fn main() {
     // Raise to USER_INTERACTIVE so the OS schedules this on a P-core with the
     // same priority as the trading engine. Without this the exchange thread can
     // be starved behind lower-priority work, adding scheduling jitter.
+    #[cfg(target_os = "macos")]
     unsafe { pthread_set_qos_class_self_np(0x21, 0); }
 
     let socket = UdpSocket::bind(ORDER_ADDR)

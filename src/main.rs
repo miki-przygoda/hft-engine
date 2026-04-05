@@ -3,10 +3,11 @@ mod models;
 #[cfg(feature = "testing")]
 mod testing_scripts;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
+use models::LatencyHistogram;
 
 pub(crate) const BUFFER_SIZE:     usize = 1024;
 pub(crate) const TRADE_LOG_SIZE:  usize = 1024;
@@ -22,7 +23,14 @@ fn main() {
     });
 
     let order_book = Arc::new(models::OrderBook {
-        trade_log: models::TradeLog::new(),
+        trade_log:    models::TradeLog::new(),
+        sig_hist:     LatencyHistogram::new(),
+        rt_hist:      LatencyHistogram::new(),
+        stall_count:  AtomicU64::new(0),
+        gap_count:    AtomicU64::new(0),
+        dirty:        AtomicBool::new(false),
+        halt:         AtomicBool::new(false),
+        net_position: AtomicI64::new(0),
     });
 
     let order_ring = Arc::new(models::OrderRing::new());
@@ -71,11 +79,12 @@ fn main() {
 
     thread::spawn({
         let buf = Arc::clone(&buffer);
+        let ob  = Arc::clone(&order_book);
         let lpn = Arc::clone(&last_packet_ns);
         let rdy = Arc::clone(&ingestor_ready);
         move || {
             engine::set_qos_interactive();
-            engine::run_ingestor(buf, lpn, rdy);
+            engine::run_ingestor(buf, ob, lpn, rdy);
         }
     });
 
@@ -96,6 +105,9 @@ fn main() {
             }
             println!("[engine] all systems ready — entering trading loop");
             engine::set_qos_interactive();
+            // Affinity tag 1: hint the scheduler to keep the strategy thread on
+            // the same P-core cluster throughout the session (item 6).
+            engine::set_thread_affinity_tag(1);
             unsafe { engine::trading_strategy(&buf, &ob, &ring); }
         }
     });
