@@ -1,0 +1,11 @@
+# Target-specific rustflags.
+# On the i9-9900K (Coffee Lake / Skylake uarch): AVX2 + FMA available, no AVX-512.
+# `native` reads CPUID at compile time — build on the i9 box itself for best results.
+# Alternative explicit target: `skylake` (LLVM name covering Coffee Lake instruction set).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+# macOS host (cross-compile / local dev on Apple Silicon).
+# Keep the Apple Silicon target at native for local development.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
