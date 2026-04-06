@@ -35,6 +35,79 @@ unsafe extern "C" {
     fn thread_policy_set(thread: u32, flavor: u32, policy_info: *const i32, count: u32) -> i32;
 }
 
+// Memory measurement APIs.
+//   getrusage() — POSIX: peak RSS and other process resource usage.
+//   sysctl()    — BSD: read kernel parameters via numeric MIB (used for hw.memsize).
+// Both are always available on macOS and Linux; the sysctl MIBs differ by OS.
+unsafe extern "C" {
+    fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn sysctl(name: *const i32, namelen: u32, oldp: *mut u8, oldlenp: *mut usize,
+              newp: *const u8, newlen: usize) -> i32;
+}
+
+// Partial struct rusage layout for 64-bit macOS/Linux.
+// Only the fields up to and including ru_maxrss are needed.
+// On macOS: ru_maxrss is in bytes.
+// On Linux: ru_maxrss is in kilobytes.
+// Padding after each timeval accounts for the 8+4+[4] layout on 64-bit targets.
+#[repr(C)]
+struct RUsage {
+    utime_sec:  i64,       // timeval tv_sec  (offset  0)
+    utime_usec: i32,       // timeval tv_usec (offset  8)
+    _pad0:      i32,       //                 (offset 12)
+    stime_sec:  i64,       // timeval tv_sec  (offset 16)
+    stime_usec: i32,       // timeval tv_usec (offset 24)
+    _pad1:      i32,       //                 (offset 28)
+    maxrss:     i64,       // peak RSS        (offset 32)
+    _rest:      [i64; 13], // remaining fields (not read)
+}
+
+// Snapshot of memory figures at a single point in time.
+// All values are in bytes. On unsupported targets all fields are 0.
+pub(crate) struct MemoryStats {
+    /// Total physical RAM installed in the system.
+    pub total_ram:   u64,
+    /// Peak resident set size since process start (bytes).
+    pub peak_rss:    u64,
+}
+
+/// Collect memory statistics for the current process and the host system.
+/// Uses only POSIX getrusage + BSD sysctl — no external dependencies.
+pub(crate) fn collect_memory_stats() -> MemoryStats {
+    let peak_rss: u64 = unsafe {
+        const RUSAGE_SELF: i32 = 0;
+        let mut ru: RUsage = core::mem::zeroed();
+        getrusage(RUSAGE_SELF, &mut ru);
+        // macOS reports bytes; Linux reports kB — normalise to bytes.
+        #[cfg(target_os = "macos")]
+        { ru.maxrss as u64 }
+        #[cfg(not(target_os = "macos"))]
+        { ru.maxrss as u64 * 1024 }
+    };
+
+    // Total physical RAM via sysctl(CTL_HW=6, HW_MEMSIZE=24) on macOS,
+    // or sysctl(CTL_HW=6, HW_PHYSMEM=5) on other BSDs.
+    // On Linux there is no hw.memsize; fall back to 0.
+    #[cfg(target_os = "macos")]
+    let total_ram: u64 = unsafe {
+        let mib: [i32; 2] = [6, 24]; // CTL_HW, HW_MEMSIZE
+        let mut val: u64 = 0;
+        let mut len = core::mem::size_of::<u64>();
+        sysctl(mib.as_ptr(), 2, &mut val as *mut u64 as *mut u8,
+               &mut len, core::ptr::null(), 0);
+        val
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let total_ram: u64 = 0;
+
+    MemoryStats { total_ram, peak_rss }
+}
+
 #[inline(always)]
 fn elapsed_ns(start: &std::time::Instant) -> u64 {
     start.elapsed().as_nanos() as u64
@@ -192,13 +265,20 @@ pub(crate) fn run_watchdog(
             continue;
         }
 
-        print_stats(&order_book);
-        write_log(&order_book);
+        // Memory snapshot [3]: immediately before log output.
+        let mem_pre_log = collect_memory_stats();
+        print_stats(&order_book, &mem_pre_log);
+        write_log(&order_book, &mem_pre_log);
+        // Memory snapshot [4]: immediately after log write.
+        let mem_post_log = collect_memory_stats();
+        println!("[mem] snapshot [4] after log write  — Peak RSS: {} MB",
+                 mem_post_log.peak_rss / 1_048_576);
+        let _ = std::io::stdout().flush();
         std::process::exit(0);
     }
 }
 
-fn print_stats(order_book: &models::OrderBook) {
+fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
     let count  = (order_book.trade_log.write_idx.load(Ordering::Acquire) as usize).min(TRADE_LOG_SIZE);
     let trades = unsafe { &*order_book.trade_log.entries.get() };
 
@@ -266,9 +346,21 @@ fn print_stats(order_book: &models::OrderBook) {
              stall_count, gap_count, net_position, halted);
 
     let _ = std::io::stdout().flush();
+
+    let total_ram_mb   = order_book.mem_total_ram.load(Ordering::Relaxed) / 1_048_576;
+    let rss_start_mb   = order_book.mem_rss_start.load(Ordering::Relaxed) / 1_048_576;
+    let rss_ready_mb   = order_book.mem_rss_ready.load(Ordering::Relaxed) / 1_048_576;
+    let rss_pre_log_mb = mem_pre_log.peak_rss / 1_048_576;
+    println!("{}", "─".repeat(55));
+    println!("Memory — Total RAM: {} MB", total_ram_mb);
+    println!("  [1] start          Peak RSS: {} MB", rss_start_mb);
+    println!("  [2] after ready    Peak RSS: {} MB", rss_ready_mb);
+    println!("  [3] before log     Peak RSS: {} MB", rss_pre_log_mb);
+
+    let _ = std::io::stdout().flush();
 }
 
-fn write_log(order_book: &models::OrderBook) {
+fn write_log(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
     let count  = (order_book.trade_log.write_idx.load(Ordering::Acquire) as usize).min(TRADE_LOG_SIZE);
     let trades = unsafe { &*order_book.trade_log.entries.get() };
 
@@ -297,6 +389,17 @@ fn write_log(order_book: &models::OrderBook) {
     json.push_str(&format!("  \"halted\": {},\n", order_book.halt.load(Ordering::Relaxed)));
     json.push_str(&format!("  \"stall_count\": {},\n", order_book.stall_count.load(Ordering::Relaxed)));
     json.push_str(&format!("  \"gap_count\": {},\n", order_book.gap_count.load(Ordering::Relaxed)));
+
+    json.push_str("  \"memory\": {\n");
+    json.push_str(&format!("    \"total_ram_mb\": {},\n",
+        order_book.mem_total_ram.load(Ordering::Relaxed) / 1_048_576));
+    json.push_str(&format!("    \"peak_rss_start_mb\": {},\n",
+        order_book.mem_rss_start.load(Ordering::Relaxed) / 1_048_576));
+    json.push_str(&format!("    \"peak_rss_ready_mb\": {},\n",
+        order_book.mem_rss_ready.load(Ordering::Relaxed) / 1_048_576));
+    json.push_str(&format!("    \"peak_rss_pre_log_mb\": {}\n",
+        mem_pre_log.peak_rss / 1_048_576));
+    json.push_str("  },\n");
 
     if count > 0 {
         let mut sig_sum  = 0u64;

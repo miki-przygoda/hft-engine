@@ -107,6 +107,10 @@ pub(crate) struct OrderBook {
     // Risk management (item 5)
     pub(crate) halt:         AtomicBool,        // permanent stop flag; set by halt_trading(), never cleared
     pub(crate) net_position: AtomicI64,         // sole writer: strategy thread; incremented on each long trade
+    // Memory snapshots — written once by main before threads spawn; read at shutdown by watchdog.
+    pub(crate) mem_total_ram:  AtomicU64,       // total physical RAM (bytes), snapshot [1]
+    pub(crate) mem_rss_start:  AtomicU64,       // peak RSS before buffer allocation, snapshot [1]
+    pub(crate) mem_rss_ready:  AtomicU64,       // peak RSS after pre-touch + process setup, snapshot [2]
 }
 
 // ── Multi-instrument scaffold (item 8) ──────────────────────────────────────

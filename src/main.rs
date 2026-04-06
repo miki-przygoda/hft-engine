@@ -16,6 +16,9 @@ pub(crate) const ORDER_RING_SIZE: usize = 1024;
 fn main() {
     println!("[engine] starting — running full simulation in-process");
 
+    // Memory snapshot [1]: very start, before any buffer allocation.
+    let mem_start = engine::collect_memory_stats();
+
     let buffer = Arc::new(models::RingBuffer {
         ticks:      unsafe { std::mem::zeroed() },
         latest_idx: AtomicU64::new(0),
@@ -23,14 +26,17 @@ fn main() {
     });
 
     let order_book = Arc::new(models::OrderBook {
-        trade_log:    models::TradeLog::new(),
-        sig_hist:     LatencyHistogram::new(),
-        rt_hist:      LatencyHistogram::new(),
-        stall_count:  AtomicU64::new(0),
-        gap_count:    AtomicU64::new(0),
-        dirty:        AtomicBool::new(false),
-        halt:         AtomicBool::new(false),
-        net_position: AtomicI64::new(0),
+        trade_log:     models::TradeLog::new(),
+        sig_hist:      LatencyHistogram::new(),
+        rt_hist:       LatencyHistogram::new(),
+        stall_count:   AtomicU64::new(0),
+        gap_count:     AtomicU64::new(0),
+        dirty:         AtomicBool::new(false),
+        halt:          AtomicBool::new(false),
+        net_position:  AtomicI64::new(0),
+        mem_total_ram: AtomicU64::new(mem_start.total_ram),
+        mem_rss_start: AtomicU64::new(mem_start.peak_rss),
+        mem_rss_ready: AtomicU64::new(0),  // filled after pre-touch below
     });
 
     let order_ring = Arc::new(models::OrderRing::new());
@@ -54,6 +60,10 @@ fn main() {
             std::ptr::write_volatile(log.add(i), 0);
         }
     }
+
+    // Memory snapshot [2]: after all buffers are pre-touched, before spawning threads.
+    let mem_ready = engine::collect_memory_stats();
+    order_book.mem_rss_ready.store(mem_ready.peak_rss, Ordering::Relaxed);
 
     let ingestor_ready = Arc::new(AtomicBool::new(false));
     let exchange_ready = Arc::new(AtomicBool::new(false));
