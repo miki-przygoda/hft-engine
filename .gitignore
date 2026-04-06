@@ -27,3 +27,7 @@ TODOs/
 # MacOS:
 
 .DS_Store
+
+# Linux:
+
+setup_cores.sh
