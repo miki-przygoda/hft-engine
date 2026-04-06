@@ -556,7 +556,6 @@ pub(crate) fn run_market_simulator(ingestor_ready: Arc<AtomicBool>) {
 //   vpalignr shifts the window by one f32 across the 128-bit lane boundary.
 //   vhaddps × 2 + vpermilps + vaddss reduce 8 floats to a scalar sum.
 //   vucomiss + seta produce the 0/1 trigger with no branch in the signal path.
-#[inline(always)]
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
 pub(crate) unsafe fn trading_strategy(
     buffer: &models::RingBuffer,

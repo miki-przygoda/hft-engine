@@ -54,6 +54,16 @@ fn main() {
     println!("1M Ops Time:  {:.4} ns", (duration.as_nanos() as f64 / total_ops) * 1_000_000.0);
 }
 
+#[cfg(target_arch = "x86_64")]
+fn mode_name(mode: ComputeMode) -> &'static str {
+    match mode {
+        ComputeMode::Avx512 => "AVX-512 (512-bit, 16×f32)",
+        ComputeMode::Avx2   => "AVX2 (256-bit, 8×f32)",
+        ComputeMode::Sse    => "SSE (128-bit, 4×f32)",
+        ComputeMode::Scalar => "Scalar (no SIMD)",
+    }
+}
+
 #[inline(always)]
 fn select_mode() -> ComputeMode {
     #[cfg(target_arch = "x86_64")]
