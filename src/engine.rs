@@ -116,14 +116,61 @@ fn elapsed_ns(start: &std::time::Instant) -> u64 {
 pub(crate) fn set_qos_interactive() {
     #[cfg(target_os = "macos")]
     unsafe { pthread_set_qos_class_self_np(0x21, 0); }
-    // Linux equivalent: sched_setaffinity / pthread_setaffinity_np — no-op here
-    // until a production Linux target is added.
+
+    // Linux: elevate the calling thread to SCHED_FIFO at priority 50.
+    // Strategy/ingestor/exchange call this; watchdog and simulator do not,
+    // so they stay on SCHED_OTHER and cannot block the hot path even if they
+    // happen to land on the same core.
+    // Requires CAP_SYS_NICE — run the binary with sudo.
+    #[cfg(target_os = "linux")]
+    unsafe { linux_set_fifo(50); }
 }
 
-// Set a Mach thread affinity tag for the calling thread (item 6).
-// Same tag = same cluster hint from the scheduler. Tag 1 reserved for the
-// strategy thread; the OS will prefer keeping it on the same P-core cluster.
-// No-op on non-macOS targets.
+// Linux: set the calling thread's scheduler to SCHED_FIFO at `priority`.
+// Uses a raw syscall (sched_setscheduler, NR=144) to avoid a libc dependency.
+// pid=0 targets the calling thread in a multi-threaded process.
+#[cfg(target_os = "linux")]
+unsafe fn linux_set_fifo(priority: i32) {
+    // struct sched_param { int sched_priority; } — single i32 on all Linux ABIs.
+    let param: i32 = priority;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") 144i64 => _,        // NR_sched_setscheduler → ret (ignored)
+        in("rdi") 0i64,                       // pid = 0 → calling thread
+        in("rsi") 1i64,                       // SCHED_FIFO
+        in("rdx") &param as *const i32,
+        out("rcx") _, out("r11") _,           // clobbered by syscall ABI
+        options(nostack),
+    );
+}
+
+// Linux: pin the calling thread to `core` via sched_setaffinity (NR=203).
+// cpu_set_t is represented as a single u64 (sufficient for ≤ 64 cores).
+#[cfg(target_os = "linux")]
+unsafe fn linux_pin_to_core(core: usize) {
+    let mask: u64 = 1u64 << core;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") 203i64 => _,        // NR_sched_setaffinity → ret (ignored)
+        in("rdi") 0i64,                       // pid = 0 → calling thread
+        in("rsi") 8i64,                       // cpusetsize = sizeof(u64)
+        in("rdx") &mask as *const u64,
+        out("rcx") _, out("r11") _,
+        options(nostack),
+    );
+}
+
+// Thread affinity tag → dedicated core mapping (i9-9900K layout).
+//
+// Tag | Thread   | Core | Rationale
+// ----|----------|------|------------------------------------------
+//  1  | strategy | 2    | isolated hot path, no sharing
+//  2  | ingestor | 3    | feeds the ring buffer, needs its own core
+//  3  | exchange | 4    | drains the order ring, needs its own core
+//
+// Cores 0-1 are left for the OS, watchdog, and simulator so they can't
+// interfere with the critical threads even under load.
+// Adjust the core numbers to match your actual CPU topology if needed.
 pub(crate) fn set_thread_affinity_tag(tag: i32) {
     #[cfg(target_os = "macos")]
     unsafe {
@@ -132,7 +179,19 @@ pub(crate) fn set_thread_affinity_tag(tag: i32) {
         let thread = mach_thread_self();
         thread_policy_set(thread, THREAD_AFFINITY_POLICY, &tag, THREAD_AFFINITY_POLICY_COUNT);
     }
-    let _ = tag; // suppress unused-variable warning on non-macOS
+
+    #[cfg(target_os = "linux")]
+    {
+        let core: usize = match tag {
+            1 => 2, // strategy
+            2 => 3, // ingestor
+            3 => 4, // exchange
+            _ => return,
+        };
+        unsafe { linux_pin_to_core(core); }
+    }
+
+    let _ = tag;
 }
 
 // Called on any risk-limit breach. #[cold] biases the branch predictor in the
