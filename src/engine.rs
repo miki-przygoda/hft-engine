@@ -90,8 +90,7 @@ pub(crate) fn collect_memory_stats() -> MemoryStats {
     };
 
     // Total physical RAM via sysctl(CTL_HW=6, HW_MEMSIZE=24) on macOS,
-    // or sysctl(CTL_HW=6, HW_PHYSMEM=5) on other BSDs.
-    // On Linux there is no hw.memsize; fall back to 0.
+    // or sysconf(_SC_PHYS_PAGES * _SC_PAGE_SIZE) on Linux (no hw.memsize MIB).
     #[cfg(target_os = "macos")]
     let total_ram: u64 = unsafe {
         let mib: [i32; 2] = [6, 24]; // CTL_HW, HW_MEMSIZE
@@ -102,7 +101,17 @@ pub(crate) fn collect_memory_stats() -> MemoryStats {
         val
     };
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    let total_ram: u64 = unsafe {
+        extern "C" { fn sysconf(name: i32) -> i64; }
+        const SC_PHYS_PAGES: i32 = 85; // _SC_PHYS_PAGES — GNU extension, glibc/musl
+        const SC_PAGE_SIZE:  i32 = 30; // _SC_PAGE_SIZE  — POSIX
+        let pages     = sysconf(SC_PHYS_PAGES);
+        let page_size = sysconf(SC_PAGE_SIZE);
+        if pages > 0 && page_size > 0 { pages as u64 * page_size as u64 } else { 0 }
+    };
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let total_ram: u64 = 0;
 
     MemoryStats { total_ram, peak_rss }
