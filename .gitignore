@@ -17,8 +17,8 @@ target/
 .idea/
 Cargo.lock
 
-# Claude Code — local-only settings (API keys, personal overrides)
-.claude/settings.local.json
+# Claude Code — dev tooling, not relevant to project consumers
+.claude/
 
 
 logs/
