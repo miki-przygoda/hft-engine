@@ -90,8 +90,7 @@ pub(crate) fn collect_memory_stats() -> MemoryStats {
     };
 
     // Total physical RAM via sysctl(CTL_HW=6, HW_MEMSIZE=24) on macOS,
-    // or sysctl(CTL_HW=6, HW_PHYSMEM=5) on other BSDs.
-    // On Linux there is no hw.memsize; fall back to 0.
+    // or sysconf(_SC_PHYS_PAGES * _SC_PAGE_SIZE) on Linux (no hw.memsize MIB).
     #[cfg(target_os = "macos")]
     let total_ram: u64 = unsafe {
         let mib: [i32; 2] = [6, 24]; // CTL_HW, HW_MEMSIZE
@@ -102,7 +101,17 @@ pub(crate) fn collect_memory_stats() -> MemoryStats {
         val
     };
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    let total_ram: u64 = unsafe {
+        extern "C" { fn sysconf(name: i32) -> i64; }
+        const SC_PHYS_PAGES: i32 = 85; // _SC_PHYS_PAGES — GNU extension, glibc/musl
+        const SC_PAGE_SIZE:  i32 = 30; // _SC_PAGE_SIZE  — POSIX
+        let pages     = sysconf(SC_PHYS_PAGES);
+        let page_size = sysconf(SC_PAGE_SIZE);
+        if pages > 0 && page_size > 0 { pages as u64 * page_size as u64 } else { 0 }
+    };
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let total_ram: u64 = 0;
 
     MemoryStats { total_ram, peak_rss }
@@ -116,14 +125,61 @@ fn elapsed_ns(start: &std::time::Instant) -> u64 {
 pub(crate) fn set_qos_interactive() {
     #[cfg(target_os = "macos")]
     unsafe { pthread_set_qos_class_self_np(0x21, 0); }
-    // Linux equivalent: sched_setaffinity / pthread_setaffinity_np — no-op here
-    // until a production Linux target is added.
+
+    // Linux: elevate the calling thread to SCHED_FIFO at priority 50.
+    // Strategy/ingestor/exchange call this; watchdog and simulator do not,
+    // so they stay on SCHED_OTHER and cannot block the hot path even if they
+    // happen to land on the same core.
+    // Requires CAP_SYS_NICE — run the binary with sudo.
+    #[cfg(target_os = "linux")]
+    unsafe { linux_set_fifo(50); }
 }
 
-// Set a Mach thread affinity tag for the calling thread (item 6).
-// Same tag = same cluster hint from the scheduler. Tag 1 reserved for the
-// strategy thread; the OS will prefer keeping it on the same P-core cluster.
-// No-op on non-macOS targets.
+// Linux: set the calling thread's scheduler to SCHED_FIFO at `priority`.
+// Uses a raw syscall (sched_setscheduler, NR=144) to avoid a libc dependency.
+// pid=0 targets the calling thread in a multi-threaded process.
+#[cfg(target_os = "linux")]
+unsafe fn linux_set_fifo(priority: i32) {
+    // struct sched_param { int sched_priority; } — single i32 on all Linux ABIs.
+    let param: i32 = priority;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") 144i64 => _,        // NR_sched_setscheduler → ret (ignored)
+        in("rdi") 0i64,                       // pid = 0 → calling thread
+        in("rsi") 1i64,                       // SCHED_FIFO
+        in("rdx") &param as *const i32,
+        out("rcx") _, out("r11") _,           // clobbered by syscall ABI
+        options(nostack),
+    );
+}
+
+// Linux: pin the calling thread to `core` via sched_setaffinity (NR=203).
+// cpu_set_t is represented as a single u64 (sufficient for ≤ 64 cores).
+#[cfg(target_os = "linux")]
+unsafe fn linux_pin_to_core(core: usize) {
+    let mask: u64 = 1u64 << core;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") 203i64 => _,        // NR_sched_setaffinity → ret (ignored)
+        in("rdi") 0i64,                       // pid = 0 → calling thread
+        in("rsi") 8i64,                       // cpusetsize = sizeof(u64)
+        in("rdx") &mask as *const u64,
+        out("rcx") _, out("r11") _,
+        options(nostack),
+    );
+}
+
+// Thread affinity tag → dedicated core mapping (i9-9900K layout).
+//
+// Tag | Thread   | Core | Rationale
+// ----|----------|------|------------------------------------------
+//  1  | strategy | 2    | isolated hot path, no sharing
+//  2  | ingestor | 3    | feeds the ring buffer, needs its own core
+//  3  | exchange | 4    | drains the order ring, needs its own core
+//
+// Cores 0-1 are left for the OS, watchdog, and simulator so they can't
+// interfere with the critical threads even under load.
+// Adjust the core numbers to match your actual CPU topology if needed.
 pub(crate) fn set_thread_affinity_tag(tag: i32) {
     #[cfg(target_os = "macos")]
     unsafe {
@@ -132,7 +188,19 @@ pub(crate) fn set_thread_affinity_tag(tag: i32) {
         let thread = mach_thread_self();
         thread_policy_set(thread, THREAD_AFFINITY_POLICY, &tag, THREAD_AFFINITY_POLICY_COUNT);
     }
-    let _ = tag; // suppress unused-variable warning on non-macOS
+
+    #[cfg(target_os = "linux")]
+    {
+        let core: usize = match tag {
+            1 => 2, // strategy
+            2 => 3, // ingestor
+            3 => 4, // exchange
+            _ => return,
+        };
+        unsafe { linux_pin_to_core(core); }
+    }
+
+    let _ = tag;
 }
 
 // Called on any risk-limit breach. #[cold] biases the branch predictor in the
@@ -551,11 +619,12 @@ pub(crate) fn run_market_simulator(ingestor_ready: Arc<AtomicBool>) {
 //   assistance. The stall_count already serves as the jitter proxy — a spike
 //   in stall_count at a given trade sequence indicates OS preemption.
 //
-// x86_64 signal logic (item 7):
-//   Window kept in a [f32; 8] stack array (L1-resident). Mean computed via
-//   horizontal SSE add. Not register-resident; see one_threaded.rs for the
-//   AVX2 reference. The structure is identical to the ARM64 path.
-#[inline(always)]
+// x86_64 signal logic (AVX2, targeting i9-9900K Coffee Lake):
+//   Window is register-resident in a single YMM register (8×f32 = 256 bits).
+//   vpalignr shifts the window by one f32 across the 128-bit lane boundary.
+//   vhaddps × 2 + vpermilps + vaddss reduce 8 floats to a scalar sum.
+//   vucomiss + seta produce the 0/1 trigger with no branch in the signal path.
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
 pub(crate) unsafe fn trading_strategy(
     buffer: &models::RingBuffer,
     order_book: &models::OrderBook,
@@ -570,14 +639,15 @@ pub(crate) unsafe fn trading_strategy(
         // ARM64: register-resident float32x4_t pair bound to NEON v-registers via
         //        inout(vreg). The compiler assigns them to vN registers and preserves
         //        them across the asm block as live Rust variables.
-        // x86_64: [f32; 8] stack array; not register-resident (register-resident
-        //         AVX2 path is the next step — see TODO item 7 note in one_threaded.rs).
+        // x86_64: register-resident __m256 (ymm register) holding the 8-price window.
+        //         8×f32 = 256 bits fits exactly in one YMM register. Updated each tick
+        //         via vpalignr (cross-128-bit shift) + vinsertf128 (lane rebuild).
         #[cfg(target_arch = "aarch64")]
         let (mut win_lo, mut win_hi): (float32x4_t, float32x4_t) =
             (core::mem::zeroed(), core::mem::zeroed());
 
         #[cfg(target_arch = "x86_64")]
-        let mut win_buf: [f32; 8] = [0.0; 8];
+        let mut win: std::arch::x86_64::__m256 = core::mem::zeroed();
 
         // Scale factor for signal threshold: sum * (1/8 * 1.001) = mean * 1.001.
         // Computed once at startup; loaded into a SIMD scalar register each tick.
@@ -595,14 +665,18 @@ pub(crate) unsafe fn trading_strategy(
             black_box(elapsed_ns(&buffer.start_time));
         }
 
+        // AVX2 warmup: exercise 256-bit vector execution units (ymm registers),
+        // pull hot-path code into the instruction cache, and commit OS pages for
+        // start_time (via elapsed_ns). vmulps ymm operates on 8 f32 lanes — matches
+        // the production window size and warms the same FP execution port.
         #[cfg(target_arch = "x86_64")]
         for _ in 0..10_000 {
             let mut dummy: u32;
             asm!(
-                "mulps xmm0, xmm0",
-                "movd {res:e}, xmm0",
+                "vmulps ymm0, ymm0, ymm0",
+                "vmovd {res:e}, xmm0",
                 res = out(reg) dummy,
-                out("xmm0") _,
+                out("ymm0") _,
                 options(nostack, nomem)
             );
             black_box(dummy);
@@ -681,17 +755,66 @@ pub(crate) unsafe fn trading_strategy(
                         result
                     };
 
+                    // x86_64 AVX2 register-resident 8-price momentum window.
+                    //
+                    // Window layout in ymm register (one f32 per lane):
+                    //   low  128-bit half (xmm): [p_oldest, p+1, p+2, p+3]
+                    //   high 128-bit half:        [p+4,     p+5, p+6, p_newest]
+                    //
+                    // Shift protocol (vpalignr — AVX2 cross-byte shift within 128-bit lanes):
+                    //   extract lo/hi halves with vextractf128
+                    //   new_lo = vpalignr(hi, lo, 4)  → [p+1, p+2, p+3, p+4]
+                    //   new_hi = vpalignr(price, hi, 4) → [p+5, p+6, p_newest, new_price]
+                    //   rebuild 256-bit win with vinsertf128
+                    //
+                    // Horizontal sum (8 f32 → scalar):
+                    //   two vhaddps passes reduce to 2 partial sums in xmm
+                    //   vpermilps + vaddss for cross-element final reduction
+                    //
+                    // Trigger: new_price > (total_sum * momentum_scale)
+                    //          where momentum_scale = 1/(8 * 1.001) ≈ 0.125125
                     #[cfg(target_arch = "x86_64")]
                     let decision: u32 = {
-                        // Shift window: drop oldest price, insert new price at end.
                         let price = (tick_ptr as *const models::MarketTick as *const f32).read();
-                        for i in 0..7 { win_buf[i] = win_buf[i + 1]; }
-                        win_buf[7] = price;
-                        // Sum via scalar iteration; AVX2 horizontal-add path is
-                        // the register-optimised version (see one_threaded.rs).
-                        let sum: f32 = win_buf.iter().copied().sum();
-                        let threshold = f32::from_bits(momentum_scale); // mean * 1.001
-                        (price > sum * threshold) as u32
+                        let threshold_scale = f32::from_bits(momentum_scale);
+                        let mut result: u32;
+                        asm!(
+                            // --- Window shift ---
+                            // Extract 128-bit halves: xmm0 = lo [p0..p3], xmm1 = hi [p4..p7]
+                            "vextractf128 xmm0, {win}, 0",
+                            "vextractf128 xmm1, {win}, 1",
+                            // Shift lo: [p1, p2, p3, p4] = concat(hi, lo) >> 4 bytes
+                            "vpalignr xmm0, xmm1, xmm0, 4",
+                            // Shift hi: [p5, p6, p7, new_price] = concat(price, hi) >> 4 bytes
+                            // {price} is a compiler-allocated xmm holding the new price scalar
+                            "vpalignr xmm1, {price}, xmm1, 4",
+                            // Rebuild 256-bit window with updated halves
+                            "vinsertf128 {win}, {win}, xmm0, 0",
+                            "vinsertf128 {win}, {win}, xmm1, 1",
+                            // --- Horizontal sum over all 8 updated prices ---
+                            // [p1+p2, p3+p4, p5+p6, p7+new]
+                            "vhaddps xmm0, xmm0, xmm1",
+                            // [(p1+p2+p3+p4), (p5+p6+p7+new), same×2]
+                            "vhaddps xmm0, xmm0, xmm0",
+                            // Move high pair sum to xmm1[0] for final cross-element add
+                            "vpermilps xmm1, xmm0, 1",
+                            // xmm0[0] = total sum of all 8 prices
+                            "vaddss xmm0, xmm0, xmm1",
+                            // --- Threshold: total_sum * momentum_scale = mean * 1.001 ---
+                            "vmulss xmm0, xmm0, {scale}",
+                            // --- Compare: new_price > threshold → result = 1 ---
+                            // vucomiss sets ZF=CF=0 when src1 > src2 (ordered, no NaN)
+                            "vucomiss {price}, xmm0",
+                            "seta {res:l}",
+                            "movzx {res:e}, {res:l}",
+                            win   = inout(ymm_reg) win,
+                            price = in(xmm_reg) price,
+                            scale = in(xmm_reg) threshold_scale,
+                            res   = lateout(reg) result,
+                            out("xmm0") _, out("xmm1") _,
+                            options(nostack, nomem)
+                        );
+                        result
                     };
 
                     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]

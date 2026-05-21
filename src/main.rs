@@ -83,6 +83,7 @@ fn main() {
         let rdy  = Arc::clone(&exchange_ready);
         move || {
             engine::set_qos_interactive();
+            engine::set_thread_affinity_tag(3); // exchange → core 4
             engine::run_in_process_exchange(ring, buf, ob, rdy);
         }
     });
@@ -94,6 +95,7 @@ fn main() {
         let rdy = Arc::clone(&ingestor_ready);
         move || {
             engine::set_qos_interactive();
+            engine::set_thread_affinity_tag(2); // ingestor → core 3
             engine::run_ingestor(buf, ob, lpn, rdy);
         }
     });
