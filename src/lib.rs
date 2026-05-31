@@ -1,4 +1,16 @@
+//! Shared configuration for the engine and its standalone binaries.
+//!
+//! This crate exists purely to share compile-time constants between the
+//! self-contained `trading-engine` and the standalone `market-simulator` /
+//! `fake-exchange` binaries (e.g. `WARMUP_PACKETS`, port addresses, packet
+//! sizes). Keeping them in one place prevents the engine and the simulator from
+//! drifting out of sync — see invariant #9 in `CLAUDE.md`.
+
+/// Engine-wide tunable constants. All values are compile-time and dependency-free.
 pub mod config {
+    /// Warmup packets the engine runs through the full hot path *without*
+    /// committing to the trade log (trains caches and the branch predictor).
+    /// The standalone simulator must send exactly this many warmup packets first.
     pub const WARMUP_PACKETS:        u64   = 10;
     pub const REAL_PACKETS:          u64   = 100;   // used by standalone market-simulator binary
     pub const TOTAL_PACKETS:         u64   = WARMUP_PACKETS + REAL_PACKETS;

@@ -1,3 +1,14 @@
+//! `trading-engine` — the self-contained in-process HFT simulation.
+//!
+//! This binary's `main` is the orchestrator: it allocates the three lock-free
+//! shared buffers (`RingBuffer`, `OrderRing`, `OrderBook`/`TradeLog`),
+//! **pre-touches** every cache line so the hot path never takes a page fault,
+//! then spawns the five threads (watchdog, exchange, ingestor, simulator, and
+//! the strategy on the main thread) and joins the strategy.
+//!
+//! See `CLAUDE.md` for the full architecture and the list of invariants this
+//! startup sequence depends on.
+
 mod engine;
 mod models;
 #[cfg(feature = "testing")]

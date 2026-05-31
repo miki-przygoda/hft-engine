@@ -1,0 +1,54 @@
+name: CI
+
+# Build the engine on both supported platforms:
+#   - Linux x86_64  → AVX2 signal path, SCHED_FIFO / affinity
+#   - macOS arm64   → NEON signal path, QOS P-core bias
+#
+# The release build is the hard gate (it must be warning-free). Clippy runs as
+# informational only — the codebase uses deliberate manual column alignment, so
+# `cargo fmt --check` is intentionally NOT enforced.
+#
+# To conserve Actions minutes, include "[skip ci]" in a commit message to skip a
+# run (e.g. the final commit before opening a PR, once validated locally).
+# Runs can also be triggered manually from the Actions tab (workflow_dispatch).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy
+          rustc --version
+          cargo --version
+
+      # Hard gate: every declared and auto-discovered binary must compile on this
+      # platform. This is exactly the check that catches a cfg'd-out path breaking
+      # on the OS that doesn't compile it. target-cpu=native comes from
+      # .cargo/config.toml; RUSTFLAGS is intentionally left unset so it applies.
+      - name: Build (release)
+        run: cargo build --release --verbose
+
+      - name: Clippy (informational)
+        continue-on-error: true
+        run: cargo clippy --release --all-targets

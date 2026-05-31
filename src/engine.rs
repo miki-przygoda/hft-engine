@@ -1,3 +1,14 @@
+//! All engine runtime logic: the threads, the hot path, and reporting.
+//!
+//! This module holds every long-running routine the threads execute —
+//! [`run_ingestor`], [`run_in_process_exchange`], [`run_watchdog`],
+//! [`run_market_simulator`], and the hot path [`trading_strategy`] — plus the
+//! cross-platform scheduling helpers ([`set_qos_interactive`],
+//! [`set_thread_affinity_tag`]), memory-stat collection, and the latency
+//! reporting / JSON logging. The signal computation has two register-resident
+//! SIMD implementations selected at compile time: NEON on `aarch64`, AVX2 on
+//! `x86_64`. See `CLAUDE.md` for the design rationale and invariants.
+
 use std::arch::asm;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::float32x4_t;
@@ -122,6 +133,10 @@ fn elapsed_ns(start: &std::time::Instant) -> u64 {
     start.elapsed().as_nanos() as u64
 }
 
+/// Elevate the *calling* thread's scheduling priority: `USER_INTERACTIVE` QOS
+/// (P-core bias) on macOS, `SCHED_FIFO` priority 50 on Linux (needs
+/// `CAP_SYS_NICE`; silently no-ops otherwise). Called by the strategy, ingestor,
+/// and exchange threads only.
 pub(crate) fn set_qos_interactive() {
     #[cfg(target_os = "macos")]
     unsafe { pthread_set_qos_class_self_np(0x21, 0); }
@@ -216,6 +231,10 @@ fn halt_trading(order_book: &models::OrderBook, reason: &str) {
     eprintln!("[risk] HALT: {}", reason);
 }
 
+/// Ingestor thread: bind the UDP feed socket, spin-poll it, and publish each
+/// received tick into the [`RingBuffer`](models::RingBuffer). Stamps every tick
+/// with an ingest timestamp and flags sequence gaps via the `dirty` flag. Sole
+/// writer of `latest_idx`.
 pub(crate) fn run_ingestor(
     buffer: Arc<models::RingBuffer>,
     order_book: Arc<models::OrderBook>,
@@ -262,6 +281,10 @@ pub(crate) fn run_ingestor(
     }
 }
 
+/// Exchange thread: spin-poll the [`OrderRing`](models::OrderRing), and for each
+/// order read a confirmation timestamp and write `round_trip_ns` back into the
+/// referenced trade-log slot. Crosses zero kernel boundaries — this is what makes
+/// the in-process round trip ~163× faster than the external UDP path.
 pub(crate) fn run_in_process_exchange(
     order_ring: Arc<models::OrderRing>,
     buffer: Arc<models::RingBuffer>,
@@ -718,9 +741,9 @@ pub(crate) unsafe fn trading_strategy(
                     //   EXT shifts window by one lane; FADDP tree sums all 8.
                     //   Trigger: current_price > window_mean * 1.001
                     //
-                    // x86_64 (item 7): scalar window array + SSE horizontal sum.
-                    //   Functionally identical; register-resident AVX2 path deferred
-                    //   (see one_threaded.rs for the reference implementation).
+                    // x86_64 (item 7): register-resident AVX2 8-price window in a
+                    //   single __m256 (ymm). Functionally identical to the NEON path;
+                    //   full implementation in the x86_64 asm block below.
                     // ────────────────────────────────────────────────────────────────
 
                     #[cfg(target_arch = "aarch64")]

@@ -1,6 +1,13 @@
 # rust-hft-software
 
-A high-frequency trading engine built from scratch in Rust, targeting Apple Silicon (ARM64 / M-series) with a scalar fallback for x86_64 Linux. Zero external dependencies. Every architectural decision is evaluated in nanoseconds.
+[![CI](https://github.com/miki-przygoda/hft-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/miki-przygoda/hft-engine/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Rust 2024](https://img.shields.io/badge/Rust-edition%202024-orange.svg)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20arm64%20%7C%20Linux%20x86__64-blue.svg)
+
+A high-frequency trading engine built from scratch in Rust, targeting Apple Silicon (ARM64 / M-series) with an AVX2 path for x86_64 Linux. Zero external dependencies. Every architectural decision is evaluated in nanoseconds.
+
+> **New here?** [`CLAUDE.md`](CLAUDE.md) is the full architecture & design reference — the *why* behind every decision below. Want to contribute? See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 **Measured latency — in-process simulation:**
 
@@ -67,7 +74,7 @@ The 8-price window lives in two NEON registers (`v28`/`v29`) across loop iterati
 3. Two `FADDP` passes + `FMUL` compute the mean
 4. `FCMGT` compares current price to `mean × (1 + threshold)` — result is the trigger bit
 
-Total signal computation: ~6 NEON instructions, one tick load, zero window memory accesses between ticks. x86_64 uses an equivalent scalar `[f32; 8]` on the stack (L1-resident).
+Total signal computation: ~6 NEON instructions, one tick load, zero window memory accesses between ticks. x86_64 uses an equivalent **register-resident AVX2** path: the 8-price window lives in a single `__m256` (ymm) register, shifted each tick with `vextractf128`/`vpalignr`/`vinsertf128`, reduced with two `vhaddps` passes, and compared branchlessly via `vucomiss` + `seta`.
 
 ### Hot-path startup sequence
 
@@ -112,8 +119,8 @@ The minimum latency floor is bounded by L2 cache miss latency at the 10 ms inter
 
 ### Requirements
 
-- **macOS Apple Silicon** — full NEON path, `pthread_set_qos_class_self_np` QOS
-- **Linux x86_64** — scalar fallback, compiles and runs (no NEON asm, no QOS API)
+- **macOS Apple Silicon** — full NEON path, `pthread_set_qos_class_self_np` QOS, P-core affinity hint
+- **Linux x86_64** — register-resident AVX2 path, `SCHED_FIFO` priority + `sched_setaffinity` core pinning (require `CAP_SYS_NICE`; run with `sudo` to enable, otherwise the engine still runs without elevated scheduling)
 - **Windows** — not supported; OS scheduler overhead is incompatible with sub-microsecond targets
 
 ### Build
@@ -202,15 +209,21 @@ src/
 - **Real market data** — feed is a UDP simulator. Next step: kernel-bypass networking (DPDK / AF_XDP) and multicast reception.
 - **Calibrated signal logic** — the NEON momentum path is structurally correct and demonstrates the latency budget; the signal itself is a placeholder.
 - **Real exchange connectivity** — the `OrderRing` has the right shape for draining to FIX/OUCH/binary protocol over a real NIC from a dedicated submission thread.
-- **Linux QOS parity** — `sched_setaffinity` equivalent for the thread priority path is not yet implemented; the scalar x86_64 fallback runs but without P-core affinity hints.
+- **Generic x86 fallback** — the x86_64 signal path requires AVX2; there is no runtime SSE/scalar fallback for older CPUs yet, and the affinity core map is tuned for the i9-9900K topology.
 
 ---
 
 ## Skills demonstrated
 
-- ARM64 NEON intrinsics and inline assembly (`std::arch::asm!`) for register-resident signal computation
+- ARM64 NEON and x86_64 AVX2 intrinsics and inline assembly (`std::arch::asm!`) for register-resident signal computation
 - Cache-line-aware data structure design (`#[repr(C, align(64))]`, deliberate field ordering for L1 co-location)
-- Lock-free concurrent data structures — SPSC ring buffers with `AtomicU64` and `Acquire`/`Release` ordering on ARM64
+- Lock-free concurrent data structures — SPSC ring buffers with `AtomicU64` and `Acquire`/`Release` ordering
 - Latency measurement methodology — ns-resolution histograms, percentile reporting, OS stall detection, cross-platform comparison
-- Systems performance engineering — page pre-touch, branch predictor hints, spin-loop vs sleep tradeoffs, register-resident window state
+- Cross-platform systems performance — macOS QOS / Apple Silicon and Linux `SCHED_FIFO` + `sched_setaffinity`, page pre-touch, branch predictor hints, spin-loop vs sleep tradeoffs
 - Zero-dependency Rust — hand-rolled JSON output, Gregorian calendar calculation, no serde/chrono/rand
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE).
