@@ -103,7 +103,7 @@ pub(crate) fn collect_memory_stats() -> MemoryStats {
 
     #[cfg(target_os = "linux")]
     let total_ram: u64 = unsafe {
-        extern "C" { fn sysconf(name: i32) -> i64; }
+        unsafe extern "C" { fn sysconf(name: i32) -> i64; }
         const SC_PHYS_PAGES: i32 = 85; // _SC_PHYS_PAGES — GNU extension, glibc/musl
         const SC_PAGE_SIZE:  i32 = 30; // _SC_PAGE_SIZE  — POSIX
         let pages     = sysconf(SC_PHYS_PAGES);
@@ -142,15 +142,17 @@ pub(crate) fn set_qos_interactive() {
 unsafe fn linux_set_fifo(priority: i32) {
     // struct sched_param { int sched_priority; } — single i32 on all Linux ABIs.
     let param: i32 = priority;
-    core::arch::asm!(
-        "syscall",
-        inlateout("rax") 144i64 => _,        // NR_sched_setscheduler → ret (ignored)
-        in("rdi") 0i64,                       // pid = 0 → calling thread
-        in("rsi") 1i64,                       // SCHED_FIFO
-        in("rdx") &param as *const i32,
-        out("rcx") _, out("r11") _,           // clobbered by syscall ABI
-        options(nostack),
-    );
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 144i64 => _,        // NR_sched_setscheduler → ret (ignored)
+            in("rdi") 0i64,                       // pid = 0 → calling thread
+            in("rsi") 1i64,                       // SCHED_FIFO
+            in("rdx") &param as *const i32,
+            out("rcx") _, out("r11") _,           // clobbered by syscall ABI
+            options(nostack),
+        );
+    }
 }
 
 // Linux: pin the calling thread to `core` via sched_setaffinity (NR=203).
@@ -158,15 +160,17 @@ unsafe fn linux_set_fifo(priority: i32) {
 #[cfg(target_os = "linux")]
 unsafe fn linux_pin_to_core(core: usize) {
     let mask: u64 = 1u64 << core;
-    core::arch::asm!(
-        "syscall",
-        inlateout("rax") 203i64 => _,        // NR_sched_setaffinity → ret (ignored)
-        in("rdi") 0i64,                       // pid = 0 → calling thread
-        in("rsi") 8i64,                       // cpusetsize = sizeof(u64)
-        in("rdx") &mask as *const u64,
-        out("rcx") _, out("r11") _,
-        options(nostack),
-    );
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 203i64 => _,        // NR_sched_setaffinity → ret (ignored)
+            in("rdi") 0i64,                       // pid = 0 → calling thread
+            in("rsi") 8i64,                       // cpusetsize = sizeof(u64)
+            in("rdx") &mask as *const u64,
+            out("rcx") _, out("r11") _,
+            options(nostack),
+        );
+    }
 }
 
 // Thread affinity tag → dedicated core mapping (i9-9900K layout).
