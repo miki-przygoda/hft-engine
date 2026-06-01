@@ -97,6 +97,10 @@ CLAUDE.md                            # This file — architecture & design refer
 README.md                            # Public overview, measured latency tables
 LICENSE                              # MIT license
 CONTRIBUTING.md                      # How to build, test, and contribute
+Makefile                             # Common tasks: build/test/run/replay/live/bench
+scripts/
+├── replay.sh                        # Offline: replay a capture through the engine
+└── live.sh                          # Live: stream real Kraken trades (needs stunnel)
 docs/
 └── stunnel.conf                     # Example TLS terminator config for the live Kraken feed
 .github/

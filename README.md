@@ -210,6 +210,15 @@ src/
 The `kraken-feed` adapter brings **real Kraken trades** into the engine and measures the full reaction stack — network transit (RTT/2), signal latency, and round-trip confirm — so you can see how the data spends *milliseconds* in flight while the engine reacts in *hundreds of nanoseconds*. It's pure zero-dependency Rust: TLS is terminated by a local `stunnel`, and the adapter speaks the WebSocket protocol (handshake, RFC6455 framing, ping/pong) by hand. It also records and deterministically replays captures for offline runs.
 
 ```bash
+make replay              # offline: synthesize a capture and replay it through the engine
+make live                # live: 30s of real Kraken XBT/USD (needs stunnel — see below)
+make live DUR=60 PAIR=ETH/USD
+make help                # all targets
+```
+
+Under the hood (equivalent to `make live` / `make replay`):
+
+```bash
 # Offline (no network): synthesize a capture, then replay it through the engine
 cargo build --release
 ./target/release/kraken-feed --synth recordings/sample.krkr
@@ -217,12 +226,13 @@ HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
 ./target/release/kraken-feed --replay recordings/sample.krkr
 
 # Live: needs stunnel terminating TLS to ws.kraken.com (see docs/stunnel.conf)
+#   macOS:  brew install stunnel        Ubuntu: sudo apt-get install stunnel4
 stunnel docs/stunnel.conf &
 HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
 ./target/release/kraken-feed --live 127.0.0.1:8443 --pair XBT/USD --record recordings/live.krkr
 ```
 
-The shutdown report and JSON log gain **transit** and **end-to-end** stages alongside signal latency and round trip. See [`CLAUDE.md`](CLAUDE.md#live-data-feed-srcbinkraken-feedrs) for the wire format and design.
+On Linux, prefix the engine with `sudo` (or `SUDO=sudo make live`) for `SCHED_FIFO` + affinity (`CAP_SYS_NICE`). The shutdown report and JSON log gain **transit** and **end-to-end** stages alongside signal latency and round trip. See [`CLAUDE.md`](CLAUDE.md#live-data-feed-srcbinkraken-feedrs) for the wire format and design.
 
 ---
 
