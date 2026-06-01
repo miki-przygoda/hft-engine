@@ -39,7 +39,11 @@ fn main() {
     // Adapts to any price level (no need to know the market price up front).
     let target_dip_bps: f32 = std::env::var("HFT_TARGET_DIP_BPS")
         .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
-    if target_dip_bps > 0.0 {
+    // Downtick mode: buy on any price decrease. Fires on any feed that moves at all.
+    let buy_on_downtick = std::env::var_os("HFT_DOWNTICK").is_some();
+    if buy_on_downtick {
+        println!("[engine] downtick mode: buy on any price decrease");
+    } else if target_dip_bps > 0.0 {
         println!("[engine] dip mode: buy on a {target_dip_bps} bps dip below the rolling reference");
     } else if target_price > 0.0 {
         println!("[engine] target-price mode: buy when price ≤ {target_price}");
@@ -69,6 +73,7 @@ fn main() {
         price_hi_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
         target_price,
         target_dip_bps,
+        buy_on_downtick,
     });
 
     let order_ring = Arc::new(models::OrderRing::new());

@@ -239,9 +239,13 @@ On Linux, prefix the engine with `sudo` (or `SUDO=sudo make live`) for `SCHED_FI
 The engine buys at market on a trigger, then measures how far the **fill drifts from the price you wanted because of the latency gap** — the real cost of being slow. Two ways to trigger:
 
 ```bash
-# Relative-dip (recommended): buy on any N-bps dip below a rolling reference —
-# adapts to any price level, no need to know the market price up front.
-HFT_TARGET_DIP_BPS=5 make live PAIR=ETH/USD
+# Downtick: buy on ANY price decrease — guaranteed to fire on any feed that moves
+# at all. Best for flat/thin markets (e.g. a quiet alt pair).
+HFT_DOWNTICK=1 make live PAIR=XBT/USD
+
+# Relative-dip: buy on an N-bps dip below a rolling reference — adapts to any
+# price level. Use a small N on quiet markets (the report prints the bps it moved).
+HFT_TARGET_DIP_BPS=5 make live PAIR=XBT/USD
 
 # Absolute target: buy when the price dips through a fixed level you set.
 # (Set it WITHIN the live market range, or it never triggers — see note below.)

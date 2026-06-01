@@ -490,11 +490,14 @@ HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
 The point of the live feed is to measure not just *how fast* the engine reacts but
 *what that speed is worth* — how far the price moves against you in the latency gap.
 
-- **Relative-dip mode** (`HFT_TARGET_DIP_BPS=<bps>`, takes priority): buy on a dip
-  of N bps below a rolling EMA reference. Adapts to any absolute price level, so it
-  fires on real data without knowing the market price up front (a re-arming
-  detector waits for recovery to the reference before firing again). This is the
-  most robust trigger for live data.
+- **Downtick mode** (`HFT_DOWNTICK=1`, highest priority): buy on any price
+  decrease. Guaranteed to fire on any feed that moves at all — the fallback for
+  very flat/thin markets (a quiet pair can move < 1 bps in 30 s, below any dip
+  threshold).
+- **Relative-dip mode** (`HFT_TARGET_DIP_BPS=<bps>`): buy on a dip of N bps below
+  a rolling EMA reference. Adapts to any absolute price level, so it fires on real
+  data without knowing the market price up front (a re-arming detector waits for
+  recovery to the reference before firing again).
 - **Target-price mode** (`HFT_TARGET_PRICE=<price>`): buy each time the price dips
   down through a fixed target (a re-arming downward cross). Only fires when the
   price crosses the level *from above*, so the target must sit just below the

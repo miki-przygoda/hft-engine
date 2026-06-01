@@ -184,6 +184,10 @@ pub(crate) struct OrderBook {
     // many bps below a rolling reference; adapts to any price level. Takes priority
     // over target_price.
     pub(crate) target_dip_bps: f32,
+    // Downtick mode (HFT_DOWNTICK): buy on any price decrease. Guaranteed to fire on
+    // any feed that moves at all — the fallback for very flat/thin markets. Highest
+    // priority among the buy triggers.
+    pub(crate) buy_on_downtick: bool,
 }
 
 // ── Multi-instrument scaffold (item 8) ──────────────────────────────────────

@@ -589,7 +589,10 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
     let lo = f32::from_bits(order_book.price_lo_bits.load(Ordering::Relaxed));
     let hi = f32::from_bits(order_book.price_hi_bits.load(Ordering::Relaxed));
     println!("{}", "─".repeat(72));
-    if order_book.target_dip_bps > 0.0 {
+    if order_book.buy_on_downtick {
+        println!("Downtick buys  |  attempts: {}  filled: {}  pending: {}  (slippage vs the price we acted on)",
+                 attempts, filled, pending);
+    } else if order_book.target_dip_bps > 0.0 {
         println!("Dip buys ({:.1} bps)  |  attempts: {}  filled: {}  pending: {}  (slippage vs the price we acted on)",
                  order_book.target_dip_bps, attempts, filled, pending);
     } else if order_book.target_price > 0.0 {
@@ -600,9 +603,11 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
                  attempts, filled, pending);
     }
     if lo.is_finite() && hi.is_finite() {
-        println!("Observed price range: [{:.4}, {:.4}]", lo, hi);
-        if order_book.target_price > 0.0 && attempts == 0 {
-            println!("  → target never reached; set HFT_TARGET_PRICE within the range above");
+        let range_bps = if lo > 0.0 { (hi - lo) / lo * 10_000.0 } else { 0.0 };
+        println!("Observed price range: [{:.4}, {:.4}]  ({:.2} bps span)", lo, hi, range_bps);
+        if attempts == 0 {
+            println!("  → no buys triggered. The market moved only {:.2} bps this run; try", range_bps);
+            println!("    a smaller HFT_TARGET_DIP_BPS, HFT_DOWNTICK=1, a busier pair, or a longer run.");
         }
     }
     if let Some(s) = summarize_slippage(slippage_bps_samples(&trades[..count])) {
@@ -941,6 +946,11 @@ pub(crate) unsafe fn trading_strategy(
         let mut ref_init: bool = false;
         let mut armed:    bool = true;
 
+        // Downtick mode: buy on any price decrease (fires on any feed that moves).
+        let use_downtick = order_book.buy_on_downtick;
+        let mut prev_px:   f32  = 0.0;
+        let mut prev_init: bool = false;
+
         // Pending simulated fills (FIFO ring). When we send an order we don't know
         // the fill price yet — it's the market price one transit later. Each entry
         // resolves when a later tick's timestamp passes its due time, at which
@@ -1135,7 +1145,12 @@ pub(crate) unsafe fn trading_strategy(
                     // mode), or the SIMD breakout (default). The breakout asm runs
                     // either way to keep the window warm; its result is just ignored
                     // in target mode.
-                    let trigger = if use_dip {
+                    let trigger = if use_downtick {
+                        let fire = prev_init && price < prev_px;
+                        prev_px = price;
+                        prev_init = true;
+                        fire
+                    } else if use_dip {
                         if !ref_init { ref_px = price; ref_init = true; }
                         let thresh = ref_px * dip_mult;
                         let fire = armed && price <= thresh;
