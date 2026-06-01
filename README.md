@@ -232,7 +232,18 @@ HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
 ./target/release/kraken-feed --live 127.0.0.1:8443 --pair XBT/USD --record recordings/live.krkr
 ```
 
-On Linux, prefix the engine with `sudo` (or `SUDO=sudo make live`) for `SCHED_FIFO` + affinity (`CAP_SYS_NICE`). The shutdown report and JSON log gain **transit** and **end-to-end** stages alongside signal latency and round trip. See [`CLAUDE.md`](CLAUDE.md#live-data-feed-srcbinkraken-feedrs) for the wire format and design.
+On Linux, prefix the engine with `sudo` (or `SUDO=sudo make live`) for `SCHED_FIFO` + affinity (`CAP_SYS_NICE`).
+
+### Target price & slippage
+
+Set a price and the engine buys at market each time the price dips through it, then measures how far the **fill drifts from your target because of the latency gap** — the real cost of being slow:
+
+```bash
+HFT_TARGET_PRICE=2500 make live PAIR=ETH/USD   # buy ETH each time it dips to 2500
+HFT_TARGET_PRICE=60000 make replay             # offline, against a capture
+```
+
+Each order's fill is the market price *one transit (RTT/2) later*, so the report gains an execution block — attempts / filled / pending and **slippage in basis points** (e.g. `mean +24 bps`, meaning the fill landed ~0.24% off target while the order was in flight). With no target set it runs the breakout signal and measures slippage vs the entry price. The shutdown report and JSON also break latency into **transit** and **end-to-end** stages. See [`CLAUDE.md`](CLAUDE.md#execution-model-target-price--slippage) for the design.
 
 ---
 

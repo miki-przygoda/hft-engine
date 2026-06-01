@@ -9,7 +9,7 @@
 //! before changing field order or sizes.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::{BUFFER_SIZE, ORDER_RING_SIZE, TRADE_LOG_SIZE};
@@ -52,16 +52,18 @@ pub(crate) struct RingBuffer {
     pub(crate) start_time: Instant,    // offset 65544 — same cache line as latest_idx
 }
 
-/// One recorded trade and its full-stack latency breakdown (56 bytes, 7 × u64).
+/// One recorded trade: its full-stack latency breakdown and its fill/slippage
+/// (64 bytes, 7×u64 + 2×f32).
 ///
-/// The strategy fills every field except `round_trip_ns` and commits the slot;
-/// the exchange thread later fills `round_trip_ns` on that already-committed
-/// slot (invariant #4). The 7-u64 size is assumed by the trade-log pre-touch
-/// loop in `main` (invariant #10).
+/// The strategy fills every field except `round_trip_ns` (written by the exchange
+/// thread) and `fill_price` (written later, when the simulated market fill becomes
+/// due — one transit after the order is sent). The 64-byte size is assumed by the
+/// trade-log pre-touch loop in `main` (invariant #10).
 ///
-/// `transit_est_ns` (RTT/2 from the live feed) is copied from the tick at trade
-/// time so the per-trade end-to-end latency (transit + signal + round trip) can
-/// be reconstructed at shutdown even after the ring slot is overwritten.
+/// `target_price` is the price we intended to buy at (the configured target in
+/// target mode, or the entry price in breakout mode); `fill_price` is the market
+/// price one transit later (0.0 = still pending at shutdown). Their difference is
+/// the latency-induced slippage.
 #[derive(Copy, Clone)]
 pub(crate) struct TradeExecution {
     pub sequence:       u64,
@@ -71,13 +73,15 @@ pub(crate) struct TradeExecution {
     pub order_send_ns:  u64,
     pub round_trip_ns:  u64,   // written by exchange thread
     pub transit_est_ns: u64,   // RTT/2 transit estimate, copied from the tick
+    pub target_price:   f32,   // intended buy price (config target, or entry price)
+    pub fill_price:     f32,   // market price one transit later (0.0 = unfilled)
 }
 
 // Layout invariants, checked at compile time.
 //   #1:  MarketTick stays exactly 64 bytes (one cache line; pre-touch step = 8).
-//   #10: TradeExecution stays 56 bytes / 7 × u64 (pre-touch step = 7 in main.rs).
+//   #10: TradeExecution stays 64 bytes (pre-touch step = 8 in main.rs).
 const _: () = assert!(std::mem::size_of::<MarketTick>() == 64);
-const _: () = assert!(std::mem::size_of::<TradeExecution>() == 56);
+const _: () = assert!(std::mem::size_of::<TradeExecution>() == 64);
 
 /// Single-writer lock-free latency log.
 ///
@@ -169,6 +173,13 @@ pub(crate) struct OrderBook {
     pub(crate) mem_total_ram:  AtomicU64,       // total physical RAM (bytes), snapshot [1]
     pub(crate) mem_rss_start:  AtomicU64,       // peak RSS before buffer allocation, snapshot [1]
     pub(crate) mem_rss_ready:  AtomicU64,       // peak RSS after pre-touch + process setup, snapshot [2]
+    // Execution / slippage tracking.
+    pub(crate) attempts:      AtomicU64,        // buy attempts (sole writer: strategy)
+    pub(crate) filled:        AtomicU64,        // attempts whose simulated fill resolved (sole writer: strategy)
+    pub(crate) price_lo_bits: AtomicU32,        // min observed price (f32 bits); sole writer: ingestor
+    pub(crate) price_hi_bits: AtomicU32,        // max observed price (f32 bits); sole writer: ingestor
+    // Target-price buy level, set once by main from HFT_TARGET_PRICE. 0.0 = breakout mode.
+    pub(crate) target_price:  f32,
 }
 
 // ── Multi-instrument scaffold (item 8) ──────────────────────────────────────

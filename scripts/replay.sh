@@ -14,7 +14,9 @@ if [ ! -f "$FILE" ]; then
 fi
 
 echo "[replay] starting engine (HFT_EXTERNAL_FEED=1 — internal simulator off)…"
-HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
+[ -n "${HFT_TARGET_PRICE:-}" ] && echo "[replay] target-price mode: HFT_TARGET_PRICE=$HFT_TARGET_PRICE"
+env HFT_EXTERNAL_FEED=1 ${HFT_TARGET_PRICE:+HFT_TARGET_PRICE="$HFT_TARGET_PRICE"} \
+  ./target/release/trading-engine &
 ENG=$!
 trap 'kill "$ENG" 2>/dev/null || true' EXIT
 sleep 1.5

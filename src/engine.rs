@@ -263,6 +263,18 @@ pub(crate) fn run_ingestor(
                 }
                 last_ingest_seq = recv_seq;
 
+                // Track the observed price range (sole writer: ingestor) for the
+                // shutdown report — helps calibrate the target-price level.
+                let px = f32::from_le_bytes(pkt[0..4].try_into().unwrap());
+                if px.is_finite() {
+                    if px < f32::from_bits(order_book.price_lo_bits.load(Ordering::Relaxed)) {
+                        order_book.price_lo_bits.store(px.to_bits(), Ordering::Relaxed);
+                    }
+                    if px > f32::from_bits(order_book.price_hi_bits.load(Ordering::Relaxed)) {
+                        order_book.price_hi_bits.store(px.to_bits(), Ordering::Relaxed);
+                    }
+                }
+
                 let idx = (seq & BUFFER_MASK) as usize;
                 let ingest_time_ns = elapsed_ns(&buffer.start_time);
 
@@ -459,6 +471,30 @@ fn push_stat_json(json: &mut String, name: &str, s: &Option<Stat>, trailing_comm
     }
 }
 
+// Per-filled-trade slippage in basis points: (fill - target)/target * 1e4.
+// Positive = filled above the intended price (adverse for a buy).
+fn slippage_bps_samples(trades: &[models::TradeExecution]) -> Vec<f64> {
+    trades.iter()
+        .filter(|t| t.fill_price > 0.0 && t.target_price > 0.0)
+        .map(|t| (t.fill_price as f64 - t.target_price as f64) / t.target_price as f64 * 10_000.0)
+        .collect()
+}
+
+struct SlipStat { mean: f64, min: f64, max: f64, abs_p50: f64, abs_p95: f64, n: usize }
+
+// Signed mean/min/max plus |slippage| p50/p95 over a small sample (shutdown only).
+fn summarize_slippage(v: Vec<f64>) -> Option<SlipStat> {
+    if v.is_empty() { return None; }
+    let n = v.len();
+    let mean = v.iter().sum::<f64>() / n as f64;
+    let min = v.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut a: Vec<f64> = v.iter().map(|x| x.abs()).collect();
+    a.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let pick = |p: usize| a[((n * p).div_ceil(100).max(1) - 1).min(n - 1)];
+    Some(SlipStat { mean, min, max, abs_p50: pick(50), abs_p95: pick(95), n })
+}
+
 fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
     let count  = (order_book.trade_log.write_idx.load(Ordering::Acquire) as usize).min(TRADE_LOG_SIZE);
     let trades = unsafe { &*order_book.trade_log.entries.get() };
@@ -544,6 +580,35 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
             println!("  (end-to-end ≈ transit + signal + round-trip; the engine's own");
             println!("   reaction is the ns-scale signal+round-trip — a rounding error vs transit)");
         }
+    }
+
+    // ── Execution / slippage ────────────────────────────────────────────
+    let attempts = order_book.attempts.load(Ordering::Relaxed);
+    let filled   = order_book.filled.load(Ordering::Relaxed);
+    let pending  = attempts.saturating_sub(filled);
+    let lo = f32::from_bits(order_book.price_lo_bits.load(Ordering::Relaxed));
+    let hi = f32::from_bits(order_book.price_hi_bits.load(Ordering::Relaxed));
+    println!("{}", "─".repeat(72));
+    if order_book.target_price > 0.0 {
+        println!("Target buy @ {:.4}  |  attempts: {}  filled: {}  pending: {}",
+                 order_book.target_price, attempts, filled, pending);
+    } else {
+        println!("Breakout buys  |  attempts: {}  filled: {}  pending: {}  (slippage measured vs entry price)",
+                 attempts, filled, pending);
+    }
+    if lo.is_finite() && hi.is_finite() {
+        println!("Observed price range: [{:.4}, {:.4}]", lo, hi);
+        if order_book.target_price > 0.0 && attempts == 0 {
+            println!("  → target never reached; set HFT_TARGET_PRICE within the range above");
+        }
+    }
+    if let Some(s) = summarize_slippage(slippage_bps_samples(&trades[..count])) {
+        println!("Slippage (fill−target) — mean: {:+.2} bps   |slip|: p50 {:.2}  p95 {:.2} bps   (n={})",
+                 s.mean, s.abs_p50, s.abs_p95, s.n);
+        println!("                         worst adverse: {:+.2} bps   best: {:+.2} bps",
+                 s.max, s.min);
+    } else if attempts > 0 {
+        println!("Slippage: no fills resolved before shutdown (orders still in flight)");
     }
 
     let stall_count  = order_book.stall_count.load(Ordering::Relaxed);
@@ -675,6 +740,36 @@ fn write_log(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
         json.push_str("  \"end_to_end\": null,\n");
     }
 
+    // Execution / slippage.
+    let attempts = order_book.attempts.load(Ordering::Relaxed);
+    let filled   = order_book.filled.load(Ordering::Relaxed);
+    let pending  = attempts.saturating_sub(filled);
+    let lo = f32::from_bits(order_book.price_lo_bits.load(Ordering::Relaxed));
+    let hi = f32::from_bits(order_book.price_hi_bits.load(Ordering::Relaxed));
+    json.push_str(&format!("  \"target_price\": {},\n",
+        if order_book.target_price > 0.0 { format!("{}", order_book.target_price) } else { "null".to_string() }));
+    json.push_str(&format!("  \"attempts\": {},\n", attempts));
+    json.push_str(&format!("  \"filled\": {},\n", filled));
+    json.push_str(&format!("  \"pending\": {},\n", pending));
+    if lo.is_finite() && hi.is_finite() {
+        json.push_str(&format!("  \"price_range\": {{\"min\": {}, \"max\": {}}},\n", lo, hi));
+    } else {
+        json.push_str("  \"price_range\": null,\n");
+    }
+    match summarize_slippage(slippage_bps_samples(&trades[..count])) {
+        Some(s) => {
+            json.push_str("  \"slippage_bps\": {\n");
+            json.push_str(&format!("    \"mean\": {:.4},\n", s.mean));
+            json.push_str(&format!("    \"min\": {:.4},\n", s.min));
+            json.push_str(&format!("    \"max\": {:.4},\n", s.max));
+            json.push_str(&format!("    \"abs_p50\": {:.4},\n", s.abs_p50));
+            json.push_str(&format!("    \"abs_p95\": {:.4},\n", s.abs_p95));
+            json.push_str(&format!("    \"count\": {}\n", s.n));
+            json.push_str("  },\n");
+        }
+        None => json.push_str("  \"slippage_bps\": null,\n"),
+    }
+
     json.push_str("  \"trades\": [\n");
     for (i, t) in trades[..count].iter().enumerate() {
         let rt = if t.round_trip_ns > 0 { t.round_trip_ns.to_string() } else { "null".to_string() };
@@ -682,10 +777,14 @@ fn write_log(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
         let e2e = if t.round_trip_ns > 0 && t.transit_est_ns > 0 {
             (t.transit_est_ns + t.latency_ns + t.round_trip_ns).to_string()
         } else { "null".to_string() };
+        let fill = if t.fill_price > 0.0 { t.fill_price.to_string() } else { "null".to_string() };
+        let slip = if t.fill_price > 0.0 && t.target_price > 0.0 {
+            format!("{:.4}", (t.fill_price as f64 - t.target_price as f64) / t.target_price as f64 * 10_000.0)
+        } else { "null".to_string() };
         let comma = if i + 1 < count { "," } else { "" };
         json.push_str(&format!(
-            "    {{\"sequence\": {}, \"sig_latency_ns\": {}, \"round_trip_ns\": {}, \"transit_est_ns\": {}, \"end_to_end_ns\": {}}}{}\n",
-            t.sequence, t.latency_ns, rt, tr, e2e, comma
+            "    {{\"sequence\": {}, \"sig_latency_ns\": {}, \"round_trip_ns\": {}, \"transit_est_ns\": {}, \"end_to_end_ns\": {}, \"target_price\": {}, \"fill_price\": {}, \"slippage_bps\": {}}}{}\n",
+            t.sequence, t.latency_ns, rt, tr, e2e, t.target_price, fill, slip, comma
         ));
     }
     json.push_str("  ]\n}\n");
@@ -823,6 +922,24 @@ pub(crate) unsafe fn trading_strategy(
         // stays branchless and register-resident on both NEON and AVX2.
         let breakout_scale = (1.0_f32 + SIGNAL_MOMENTUM_BPS as f32 / 10_000.0).to_bits();
 
+        // Target-price mode: when set, buy each time the price dips through the
+        // target instead of on a breakout. `was_below` re-arms the cross detector.
+        let target_price = order_book.target_price;
+        let use_target   = target_price > 0.0;
+        let mut was_below = false;
+
+        // Pending simulated fills (FIFO ring). When we send an order we don't know
+        // the fill price yet — it's the market price one transit later. Each entry
+        // resolves when a later tick's timestamp passes its due time, at which
+        // point that tick's price becomes the fill. The gap between fill and target
+        // is the latency-induced slippage. CAP comfortably exceeds in-flight orders.
+        const PCAP:  usize = 256;
+        const PMASK: usize = PCAP - 1;
+        let mut pend_slot = [0usize; PCAP];
+        let mut pend_due  = [0u64;   PCAP];
+        let mut p_head: usize = 0;
+        let mut p_tail: usize = 0;
+
         // NEON warmup: exercise the vector execution units, pull hot-path code into
         // the instruction cache, and commit OS pages for start_time (via elapsed_ns).
         // black_box on both outputs prevents dead-code elimination.
@@ -876,6 +993,23 @@ pub(crate) unsafe fn trading_strategy(
                     }
                 } else {
                     consecutive_clean = 0;
+
+                    let price       = tick_ptr.price;
+                    let tick_now_ns = tick_ptr.timestamp;
+
+                    // Resolve any pending simulated fills that have come due: this
+                    // tick's price is the market price ~one transit after the order
+                    // was sent, so it becomes that order's fill price.
+                    while p_head != p_tail {
+                        if tick_now_ns >= pend_due[p_head & PMASK] {
+                            let fslot = pend_slot[p_head & PMASK];
+                            (*order_book.trade_log.entries.get())[fslot].fill_price = price;
+                            order_book.filled.fetch_add(1, Ordering::Relaxed);
+                            p_head += 1;
+                        } else {
+                            break;
+                        }
+                    }
 
                     // ── Signal computation (breakout) ───────────────────────────────
                     //
@@ -984,7 +1118,18 @@ pub(crate) unsafe fn trading_strategy(
                     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     let decision: u32 = 0; // unsupported arch: never trigger
 
-                    let trigger = black_box(decision) != 0;
+                    // Buy trigger: a downward cross through the target price (target
+                    // mode), or the SIMD breakout (default). The breakout asm runs
+                    // either way to keep the window warm; its result is just ignored
+                    // in target mode.
+                    let trigger = if use_target {
+                        let below = price <= target_price;
+                        let fire  = below && !was_below;
+                        was_below = below;
+                        fire
+                    } else {
+                        black_box(decision) != 0
+                    };
 
                     if trigger {
                         let buy_time_ns    = elapsed_ns(&buffer.start_time);
@@ -1019,6 +1164,10 @@ pub(crate) unsafe fn trading_strategy(
                                     // field on the tick) so end-to-end latency can be
                                     // reconstructed at shutdown after the slot is reused.
                                     entry.transit_est_ns = tick_ptr.transit_est_ns;
+                                    // Intended price (target, or entry price in breakout
+                                    // mode); fill_price stays 0 until the deferred fill.
+                                    entry.target_price   = if use_target { target_price } else { price };
+                                    entry.fill_price     = 0.0;
                                     order_book.trade_log.write_idx.fetch_add(1, Ordering::Release);
 
                                     let ring_slot = order_ring.write_idx
@@ -1028,6 +1177,17 @@ pub(crate) unsafe fn trading_strategy(
                                     oe.slot          = slot as u64;
                                     oe.order_send_ns = order_send_ns;
                                     order_ring.write_idx.fetch_add(1, Ordering::Release);
+
+                                    order_book.attempts.fetch_add(1, Ordering::Relaxed);
+                                    // Schedule the simulated market fill one transit
+                                    // (RTT/2) after the order was sent.
+                                    let due = order_send_ns + tick_ptr.transit_est_ns;
+                                    if p_tail.wrapping_sub(p_head) < PCAP {
+                                        let pi = p_tail & PMASK;
+                                        pend_slot[pi] = slot;
+                                        pend_due[pi]  = due;
+                                        p_tail += 1;
+                                    }
                                 }
                             }
                         }

@@ -57,7 +57,10 @@ fi
 echo "[live] stunnel listening on 127.0.0.1:8443"
 
 echo "[live] starting engine (HFT_EXTERNAL_FEED=1)…"
-HFT_EXTERNAL_FEED=1 $SUDO ./target/release/trading-engine & ENG=$!
+[ -n "${HFT_TARGET_PRICE:-}" ] && echo "[live] target-price mode: HFT_TARGET_PRICE=$HFT_TARGET_PRICE"
+# `env` after sudo re-applies the vars (sudo strips the environment by default).
+$SUDO env HFT_EXTERNAL_FEED=1 ${HFT_TARGET_PRICE:+HFT_TARGET_PRICE="$HFT_TARGET_PRICE"} \
+  ./target/release/trading-engine & ENG=$!
 sleep 1.5
 
 echo "[live] streaming $PAIR for ${DUR}s — recording → $REC"

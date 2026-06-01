@@ -14,7 +14,7 @@ mod models;
 #[cfg(feature = "testing")]
 mod testing_scripts;
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -29,6 +29,15 @@ fn main() {
 
     // Memory snapshot [1]: very start, before any buffer allocation.
     let mem_start = engine::collect_memory_stats();
+
+    // Optional target-price buy level. When HFT_TARGET_PRICE is set, the strategy
+    // buys at market each time the price dips to/through the target and measures
+    // the slippage vs the target caused by the latency gap. Unset / 0 → breakout.
+    let target_price: f32 = std::env::var("HFT_TARGET_PRICE")
+        .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
+    if target_price > 0.0 {
+        println!("[engine] target-price mode: buy when price ≤ {target_price}");
+    }
 
     let buffer = Arc::new(models::RingBuffer {
         ticks:      unsafe { std::mem::zeroed() },
@@ -48,6 +57,11 @@ fn main() {
         mem_total_ram: AtomicU64::new(mem_start.total_ram),
         mem_rss_start: AtomicU64::new(mem_start.peak_rss),
         mem_rss_ready: AtomicU64::new(0),  // filled after pre-touch below
+        attempts:      AtomicU64::new(0),
+        filled:        AtomicU64::new(0),
+        price_lo_bits: AtomicU32::new(f32::INFINITY.to_bits()),
+        price_hi_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+        target_price,
     });
 
     let order_ring = Arc::new(models::OrderRing::new());
@@ -67,7 +81,7 @@ fn main() {
             std::ptr::write_volatile(ring.add(i), 0);
         }
         let log = (*order_book.trade_log.entries.get()).as_ptr() as *mut u64;
-        for i in (0..TRADE_LOG_SIZE * 7).step_by(7) {  // TradeExecution = 7 × u64 (invariant #10)
+        for i in (0..TRADE_LOG_SIZE * 8).step_by(8) {  // TradeExecution = 64 bytes / 8 × u64 (invariant #10)
             std::ptr::write_volatile(log.add(i), 0);
         }
     }

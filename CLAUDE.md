@@ -276,14 +276,17 @@ pub(crate) struct TradeExecution {
     pub order_send_ns:  u64,   // when the order was pushed to the OrderRing
     pub round_trip_ns:  u64,   // confirm_recv_ns - order_send_ns (written by exchange)
     pub transit_est_ns: u64,   // RTT/2 transit estimate, copied from the tick
+    pub target_price:   f32,   // intended buy price (config target, or entry price)
+    pub fill_price:     f32,   // market price one transit later (0.0 = unfilled)
 }
 ```
 
-56 bytes (7 × u64). **Write protocol:** the strategy fills all fields, then
-commits with `fetch_add(1, Release)` on the log's `write_idx`. **Read protocol:**
-`load(Acquire)` to get the committed count, then read `[0..count]`. The exchange
-thread writes only `round_trip_ns`, and only on a slot the strategy has already
-committed and moved past — so there is never a concurrent write to one field.
+64 bytes (7×u64 + 2×f32 = one cache line). **Write protocol:** the strategy fills
+all fields, then commits with `fetch_add(1, Release)` on the log's `write_idx`.
+**Read protocol:** `load(Acquire)` to get the committed count, then read
+`[0..count]`. The exchange thread writes only `round_trip_ns`; the strategy writes
+`fill_price` later (when the simulated fill comes due) — distinct fields, distinct
+memory locations, so there is never a conflicting write. See *Execution model*.
 
 ### `LatencyHistogram` — no-allocation percentile recording
 
@@ -482,6 +485,36 @@ HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
 
 ---
 
+## Execution model (target price & slippage)
+
+The point of the live feed is to measure not just *how fast* the engine reacts but
+*what that speed is worth* — how far the price moves against you in the latency gap.
+
+- **Target-price mode** (`HFT_TARGET_PRICE=<price>`): the strategy buys each time
+  the price dips down through the target (a re-arming downward cross), instead of
+  on the SIMD breakout. This is what makes real trades happen on live data — a bare
+  breakout rarely fires in a quiet window. Unset (or `0`) → breakout mode.
+- **Deferred fill:** when an order is sent we don't yet know the fill price — it's
+  the market price one transit (RTT/2) later. Each attempt is pushed onto a small
+  FIFO of pending fills; a later tick whose timestamp passes the due time
+  (`order_send_ns + transit_est_ns`) supplies the `fill_price`. Orders still in
+  flight at shutdown are reported as *pending*.
+- **Slippage** = `fill_price − target_price`, reported in basis points
+  (signed mean, plus `|slip|` p50/p95). Positive = filled above the intended price
+  (adverse for a buy). In breakout mode the reference is the entry price, so it
+  measures the same thing: how far price drifted during the latency gap.
+- The shutdown report adds an **execution block** (target, attempts/filled/pending,
+  observed price range, slippage) and the JSON gains `target_price`, `attempts`,
+  `filled`, `pending`, `price_range`, `slippage_bps`, and per-trade
+  `target_price`/`fill_price`/`slippage_bps`. The observed price range is tracked
+  by the ingestor (sole writer) so an empty run still tells you where to set the
+  target.
+
+`HFT_EXTERNAL_FEED=1` disables the internal simulator so the live/replay feed
+drives the ingestor alone.
+
+---
+
 ## Timing primitive
 
 `elapsed_ns(start: &Instant) -> u64` is the single source of time, calling
@@ -500,10 +533,12 @@ After each run the engine writes `logs/v{version}/{date}/{HH-MM-SS}.json`:
 - Date/time from a stdlib-only Gregorian-calendar calculation — **no `chrono`**.
 - JSON built by manual string formatting — **no `serde`**.
 - Contents: version, timestamp, total trades, net position, halt state, stall &
-  gap counts, memory snapshots, and per-stage percentiles
+  gap counts, memory snapshots, per-stage latency percentiles
   (avg/min/max/p50/p95/p99/p99.9) for signal latency, round trip, **transit**, and
-  **end-to-end**, plus the full per-trade array (each trade carries its
-  `transit_est_ns` and `end_to_end_ns`).
+  **end-to-end**, the **execution block** (target price, attempts/filled/pending,
+  observed price range, **slippage** in bps), and the full per-trade array (each
+  trade carries `transit_est_ns`, `end_to_end_ns`, `target_price`, `fill_price`,
+  and `slippage_bps`).
 
 ---
 
@@ -602,9 +637,9 @@ a quick test.
    `current_seq > WARMUP_PACKETS`; the simulator must send exactly that many
    warmup packets first.
 10. **The pre-touch step sizes match the structs** (8 u64s per tick/order-entry,
-    **7 u64s per `TradeExecution`**). Changing a struct's size means changing the
-    pre-touch loop. Compile-time `assert!`s in `models.rs` pin `MarketTick` to 64
-    bytes and `TradeExecution` to 56 bytes.
+    **8 u64s per `TradeExecution`** — it is now 64 bytes). Changing a struct's
+    size means changing the pre-touch loop. Compile-time `assert!`s in `models.rs`
+    pin both `MarketTick` and `TradeExecution` to 64 bytes.
 11. **Do not replace `Instant::elapsed()` with `mach_absolute_time()` FFI.**
     Empirically ~42× slower and unit-fragile.
 12. **The v2 market-data packet is 32 bytes.** The first 16 bytes stay
