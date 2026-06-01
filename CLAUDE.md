@@ -86,7 +86,8 @@ src/
 ├── lib.rs                           # Shared config constants (rust_hft_software::config)
 ├── bin/
 │   ├── market-simulator.rs          # Standalone UDP packet sender (warmup + real packets)
-│   └── fake-exchange.rs             # Standalone spin-poll UDP exchange, echoes orders as confirms
+│   ├── fake-exchange.rs             # Standalone spin-poll UDP exchange, echoes orders as confirms
+│   └── kraken-feed.rs               # Live Kraken feed adapter (hand-rolled WebSocket, RTT, record/replay)
 └── testing_scripts/
     ├── mod.rs                       # Declares one_threaded and multi_threaded submodules
     ├── one_threaded.rs              # Single-threaded SIMD throughput benchmark (x86 + ARM)
@@ -96,6 +97,8 @@ CLAUDE.md                            # This file — architecture & design refer
 README.md                            # Public overview, measured latency tables
 LICENSE                              # MIT license
 CONTRIBUTING.md                      # How to build, test, and contribute
+docs/
+└── stunnel.conf                     # Example TLS terminator config for the live Kraken feed
 .github/
 ├── workflows/ci.yml                 # CI: build (hard gate) + clippy matrix on macOS and Linux
 └── ISSUE_TEMPLATE/
@@ -224,18 +227,22 @@ single-producer / single-consumer (SPSC) or single-writer lock-free protocols.
 ```rust
 #[repr(C, align(64))]
 pub(crate) struct MarketTick {
-    pub(crate) price:     f32,   // 4 bytes
-    pub(crate) volume:    f32,   // 4 bytes
-    pub(crate) sequence:  u64,   // 8 bytes
-    pub(crate) timestamp: u64,   // 8 bytes — ingest time (ns since engine start)
-    _unused: [u8; 36],           // padding to 64 bytes
+    pub(crate) price:          f32,  // offset  0
+    pub(crate) volume:         f32,  // offset  4
+    pub(crate) sequence:       u64,  // offset  8
+    pub(crate) timestamp:      u64,  // offset 16 — ingest time (ns since engine start)
+    pub(crate) origin_ts_ns:   u64,  // offset 24 — exchange trade time (ns since epoch)
+    pub(crate) transit_est_ns: u64,  // offset 32 — RTT/2 one-way transit estimate
+    _unused: [u8; 20],               // padding to 64 bytes
 }
 ```
 
 64 bytes exactly — one tick per cache line, no false sharing, no partial-line
 loads. The ingestor writes `timestamp` before publishing via the ring cursor;
 the strategy reads it after the matching acquire load, so visibility is
-guaranteed by the acquire/release pair.
+guaranteed by the acquire/release pair. The first 16 bytes are still
+price/volume/sequence, so legacy 16-byte packets still populate the tick; the
+live feed adds `origin_ts_ns` and `transit_est_ns` (see *Live data feed* below).
 
 ### `RingBuffer` — SPSC tick delivery
 
@@ -264,10 +271,11 @@ pub(crate) struct TradeExecution {
     pub latency_ns:     u64,   // buy_time_ns - ingest_time_ns (signal latency)
     pub order_send_ns:  u64,   // when the order was pushed to the OrderRing
     pub round_trip_ns:  u64,   // confirm_recv_ns - order_send_ns (written by exchange)
+    pub transit_est_ns: u64,   // RTT/2 transit estimate, copied from the tick
 }
 ```
 
-48 bytes (6 × u64). **Write protocol:** the strategy fills all fields, then
+56 bytes (7 × u64). **Write protocol:** the strategy fills all fields, then
 commits with `fetch_add(1, Release)` on the log's `write_idx`. **Read protocol:**
 `load(Acquire)` to get the committed count, then read `[0..count]`. The exchange
 thread writes only `round_trip_ns`, and only on a slot the strategy has already
@@ -356,24 +364,26 @@ x86) so the line is hot when the next tick lands. The tick buffer itself is
 deliberately *not* prefetched from the strategy — the ingestor writes to it, and
 a load-prefetch from the consumer would cause coherence traffic.
 
-### The signal: a register-resident momentum window
+### The signal: a register-resident breakout window
 
 An 8-price sliding window lives entirely in vector registers across loop
-iterations — no memory access for window state between ticks:
+iterations — no memory access for window state between ticks. The rule is a
+**breakout**: trigger when the new price exceeds the *maximum* of the previous 8
+ticks by `SIGNAL_MOMENTUM_BPS` basis points (a configurable threshold in
+`config`; default 10 bps).
 
 - **ARM64 (NEON):** the window is a `float32x4_t` pair (`win_lo` / `win_hi`)
-  bound via `inout(vreg)`. Each tick: `LD1` loads the new price, two `EXT`s
-  slide the window by one f32 lane, a `FADDP` tree sums the eight prices, and
-  `FCMGT` compares the current price to `mean × 1.001` — the result bit is the
-  trigger. ~6 NEON instructions, one tick load, zero window-state memory traffic.
+  bound via `inout(vreg)`. Each tick: `FMAX` + `FMAXV` reduce the previous 8
+  prices to their max, two `EXT`s slide the new price in, and `FCMGT` compares
+  the current price to `prev_max × (1 + bps)` — the result bit is the trigger.
 - **x86_64 (AVX2):** the window is a single `__m256` (8×f32 = 256 bits).
-  `vextractf128` + `vpalignr` + `vinsertf128` shift it by one lane; two
-  `vhaddps` passes plus `vpermilps`/`vaddss` reduce to the scalar sum; `vucomiss`
-  + `seta` produce the branchless 0/1 trigger.
+  `vmaxps` + `vpermilps` reduce the previous 8 to their max; `vextractf128` +
+  `vpalignr` + `vinsertf128` shift the new price in; `vucomiss` + `seta` produce
+  the branchless 0/1 trigger.
 
-This is a structurally correct momentum signal, but the threshold is a
-placeholder — it demonstrates that real signal computation fits inside the
-latency budget, not a calibrated trading strategy.
+This is a more defensible momentum rule than a bare mean comparison, but still a
+demonstration signal — it shows real signal computation fits inside the latency
+budget, not a calibrated trading strategy. The threshold is the one tunable knob.
 
 ### Risk management
 
@@ -400,6 +410,74 @@ No kernel crossings — the entire round trip is userspace shared memory.
 
 ---
 
+## Live data feed (`src/bin/kraken-feed.rs`)
+
+The engine can run on real market data via the `kraken-feed` adapter, which
+re-emits live Kraken trades as the engine's UDP packets. This lets the engine
+measure the **full reaction stack** on real data: how long the data spent in
+flight, then how fast the engine reacts.
+
+### Packet format v2 (32 bytes, little-endian)
+
+The first 16 bytes are byte-identical to the legacy packet (so old senders keep
+working); the extra 16 carry feed metadata:
+
+```
+[ 0.. 4] price f32      [ 4.. 8] volume f32     [ 8..16] sequence u64
+[16..24] origin_ts_ns   (exchange trade time, ns since epoch — informational)
+[24..32] transit_est_ns (RTT/2 one-way transit estimate — the distance metric)
+```
+
+The ingestor parses the extra fields only when it receives ≥ 32 bytes; 16-byte
+packets leave both fields zero.
+
+### Zero dependencies, TLS by proxy
+
+Kraken requires `wss://` (TLS). Rather than link a TLS crate (which would break
+the zero-dependency invariant), TLS is terminated by a local **stunnel**
+instance, and `kraken-feed` speaks plaintext TCP to it while implementing the
+WebSocket protocol *by hand*: the HTTP/1.1 `Upgrade` handshake (with hand-rolled
+SHA-1 + base64 for `Sec-WebSocket-Accept`), RFC6455 frame parse/build with
+client-side masking, and ping/pong. stunnel is an external system tool, **not** a
+cargo dependency. See `docs/stunnel.conf`.
+
+### Latency stages reported
+
+The shutdown report (console + JSON) now breaks the stack into four stages:
+
+1. **Transit (RTT/2)** — source → local arrival, estimated from WebSocket
+   ping/pong. *Milliseconds*, so it's reported in µs and computed from the trade
+   array at shutdown (it's outside the 0–10,000 ns `LatencyHistogram` range).
+2. **Signal latency** — ingest → order send (existing `sig_hist`). *Nanoseconds*.
+3. **Round trip** — order send → confirm (existing `rt_hist`). *Nanoseconds*.
+4. **End-to-end** — the sum, per trade.
+
+The headline contrast: the data spends *milliseconds* reaching us, while the
+engine reacts in *hundreds of nanoseconds* — the ns stages are a rounding error
+against transit.
+
+### Record / replay
+
+`--record FILE` captures the live feed (packets + inter-arrival timing);
+`--replay FILE` re-emits it deterministically with no network — the way to run
+and verify offline. `--synth FILE` fabricates a capture for testing. Set
+`HFT_EXTERNAL_FEED=1` when running `trading-engine` so the internal simulator is
+disabled and the external feed drives the ingestor alone.
+
+```bash
+# Offline (no network):
+./target/release/kraken-feed --synth recordings/sample.krkr
+HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
+./target/release/kraken-feed --replay recordings/sample.krkr
+
+# Live (needs stunnel — see docs/stunnel.conf):
+stunnel docs/stunnel.conf &
+HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
+./target/release/kraken-feed --live 127.0.0.1:8443 --pair XBT/USD --record recordings/live.krkr
+```
+
+---
+
 ## Timing primitive
 
 `elapsed_ns(start: &Instant) -> u64` is the single source of time, calling
@@ -418,8 +496,10 @@ After each run the engine writes `logs/v{version}/{date}/{HH-MM-SS}.json`:
 - Date/time from a stdlib-only Gregorian-calendar calculation — **no `chrono`**.
 - JSON built by manual string formatting — **no `serde`**.
 - Contents: version, timestamp, total trades, net position, halt state, stall &
-  gap counts, memory snapshots, signal-latency and round-trip percentiles
-  (avg/min/max/p50/p95/p99/p99.9), and the full per-trade array.
+  gap counts, memory snapshots, and per-stage percentiles
+  (avg/min/max/p50/p95/p99/p99.9) for signal latency, round trip, **transit**, and
+  **end-to-end**, plus the full per-trade array (each trade carries its
+  `transit_est_ns` and `end_to_end_ns`).
 
 ---
 
@@ -474,7 +554,8 @@ are behind `#[cfg(target_os = "linux")]`.
 
 ## Roadmap — what isn't here yet
 
-1. **Real market data feed** — replace the UDP simulator with kernel-bypass
+1. **Real market data feed** — *partially delivered:* the `kraken-feed` adapter
+   brings live Kraken trades in over UDP (see *Live data feed*). Next: kernel-bypass
    networking (AF_XDP / DPDK) and multicast reception (e.g. CME MDP 3.0), keeping
    the single-writer-per-`latest_idx` invariant. Consider one `RingBuffer` per
    instrument (the scaffold is in place).
@@ -517,10 +598,17 @@ a quick test.
    `current_seq > WARMUP_PACKETS`; the simulator must send exactly that many
    warmup packets first.
 10. **The pre-touch step sizes match the structs** (8 u64s per tick/order-entry,
-    6 u64s per `TradeExecution`). Changing a struct's size means changing the
-    pre-touch loop.
+    **7 u64s per `TradeExecution`**). Changing a struct's size means changing the
+    pre-touch loop. Compile-time `assert!`s in `models.rs` pin `MarketTick` to 64
+    bytes and `TradeExecution` to 56 bytes.
 11. **Do not replace `Instant::elapsed()` with `mach_absolute_time()` FFI.**
     Empirically ~42× slower and unit-fragile.
+12. **The v2 market-data packet is 32 bytes.** The first 16 bytes stay
+    byte-identical to the legacy packet; the ingestor parses `origin_ts_ns` /
+    `transit_est_ns` only when `amt >= 32`, so 16-byte senders remain valid.
+13. **stunnel terminates TLS externally; `kraken-feed` is plaintext TCP.** The
+    adapter speaks WebSocket by hand and never links a TLS library — this is what
+    keeps the workspace zero-dependency while consuming a `wss://` feed.
 
 ---
 

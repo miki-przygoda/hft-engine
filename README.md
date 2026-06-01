@@ -196,7 +196,8 @@ src/
 ├── lib.rs               # Shared config constants
 ├── bin/
 │   ├── fake-exchange.rs         # Standalone spin-poll UDP exchange (external round-trip measurement)
-│   └── market-simulator.rs      # Standalone UDP packet sender
+│   ├── market-simulator.rs      # Standalone UDP packet sender
+│   └── kraken-feed.rs           # Live Kraken feed adapter (hand-rolled WebSocket, RTT, record/replay)
 └── testing_scripts/
     ├── one_threaded.rs          # Single-threaded SIMD throughput benchmark
     └── multi_threaded.rs        # All-core Apple Silicon stress test ("The Kraken")
@@ -204,10 +205,31 @@ src/
 
 ---
 
+## Live crypto feed
+
+The `kraken-feed` adapter brings **real Kraken trades** into the engine and measures the full reaction stack — network transit (RTT/2), signal latency, and round-trip confirm — so you can see how the data spends *milliseconds* in flight while the engine reacts in *hundreds of nanoseconds*. It's pure zero-dependency Rust: TLS is terminated by a local `stunnel`, and the adapter speaks the WebSocket protocol (handshake, RFC6455 framing, ping/pong) by hand. It also records and deterministically replays captures for offline runs.
+
+```bash
+# Offline (no network): synthesize a capture, then replay it through the engine
+cargo build --release
+./target/release/kraken-feed --synth recordings/sample.krkr
+HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
+./target/release/kraken-feed --replay recordings/sample.krkr
+
+# Live: needs stunnel terminating TLS to ws.kraken.com (see docs/stunnel.conf)
+stunnel docs/stunnel.conf &
+HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
+./target/release/kraken-feed --live 127.0.0.1:8443 --pair XBT/USD --record recordings/live.krkr
+```
+
+The shutdown report and JSON log gain **transit** and **end-to-end** stages alongside signal latency and round trip. See [`CLAUDE.md`](CLAUDE.md#live-data-feed-srcbinkraken-feedrs) for the wire format and design.
+
+---
+
 ## What isn't here
 
-- **Real market data** — feed is a UDP simulator. Next step: kernel-bypass networking (DPDK / AF_XDP) and multicast reception.
-- **Calibrated signal logic** — the NEON momentum path is structurally correct and demonstrates the latency budget; the signal itself is a placeholder.
+- **Kernel-bypass networking** — the live feed arrives over loopback UDP from the adapter; the next step for the data path is AF_XDP / DPDK and multicast reception (e.g. CME MDP 3.0).
+- **Calibrated signal logic** — the breakout signal is structurally sound and demonstrates the latency budget; the threshold is a tunable placeholder, not calibrated alpha.
 - **Real exchange connectivity** — the `OrderRing` has the right shape for draining to FIX/OUCH/binary protocol over a real NIC from a dedicated submission thread.
 - **Generic x86 fallback** — the x86_64 signal path requires AVX2; there is no runtime SSE/scalar fallback for older CPUs yet, and the affinity core map is tuned for the i9-9900K topology.
 

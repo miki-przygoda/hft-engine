@@ -137,7 +137,7 @@ impl LatencyHistogram {
     // Returns 10_001 if the percentile falls in the overflow bucket.
     pub(crate) fn percentile(&self, p_num: u64, p_den: u64, total: u64) -> u64 {
         if total == 0 { return 0; }
-        let threshold = ((total * p_num + p_den - 1) / p_den).max(1);
+        let threshold = (total * p_num).div_ceil(p_den).max(1);
         let mut cum = 0u64;
         let buckets = unsafe { &*self.buckets.get() };
         for (i, &count) in buckets.iter().enumerate() {

@@ -409,7 +409,7 @@ fn summarize(mut v: Vec<u64>) -> Option<Stat> {
     let n = v.len();
     let sum: u128 = v.iter().map(|&x| x as u128).sum();
     let pct = |num: u64, den: u64| -> u64 {
-        let rank = (((n as u64) * num + den - 1) / den).max(1) as usize;
+        let rank = ((n as u64) * num).div_ceil(den).max(1) as usize;
         v[rank.min(n) - 1]
     };
     Some(Stat {

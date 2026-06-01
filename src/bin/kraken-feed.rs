@@ -116,8 +116,10 @@ fn sha1(data: &[u8]) -> [u8; 20] {
 
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut v = vec![0u8; n];
-    if let Ok(mut f) = File::open("/dev/urandom") {
-        if f.read_exact(&mut v).is_ok() { return v; }
+    if let Ok(mut f) = File::open("/dev/urandom")
+        && f.read_exact(&mut v).is_ok()
+    {
+        return v;
     }
     // Fallback: SystemTime-seeded LCG. Sec-WebSocket-Key quality is not security
     // critical for a client (the server only echoes a derived accept value).
@@ -204,10 +206,10 @@ fn parse_trades(msg: &str) -> Vec<(f32, u64)> {
         while j < n && bytes[j] != b']' { j += 1; }    // entries hold no nested arrays
         if j >= n { break; }
         let toks = quoted_tokens(&msg[i + 1..j]);
-        if toks.len() >= 3 {
-            if let (Ok(price), Some(ts)) = (toks[0].parse::<f32>(), parse_kraken_ts(&toks[2])) {
-                out.push((price, ts));
-            }
+        if toks.len() >= 3
+            && let (Ok(price), Some(ts)) = (toks[0].parse::<f32>(), parse_kraken_ts(&toks[2]))
+        {
+            out.push((price, ts));
         }
         i = j + 1;
     }
@@ -301,8 +303,10 @@ struct Recorder {
 
 impl Recorder {
     fn create(path: &str) -> io::Result<Recorder> {
-        if let Some(dir) = std::path::Path::new(path).parent() {
-            if !dir.as_os_str().is_empty() { std::fs::create_dir_all(dir)?; }
+        if let Some(dir) = std::path::Path::new(path).parent()
+            && !dir.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(dir)?;
         }
         let mut file = File::create(path)?;
         file.write_all(RECORD_MAGIC)?;
