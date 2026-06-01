@@ -1,19 +1,20 @@
-// Fake exchange — simulates the matching engine side of the round-trip.
-//
-// Design:
-//   - Non-blocking spin-poll on the order socket (QOS_CLASS_USER_INTERACTIVE)
-//     eliminates OS wakeup latency. Without this, every packet arrival costs a
-//     full thread wakeup (~10–30 µs); with spin-poll the exchange detects the
-//     packet on the very next recv attempt (~sub-µs).
-//   - Heartbeat packets (amt < 24 bytes) are silently discarded. They exist only
-//     to keep this process's socket and kernel networking state warm so real
-//     order packets find a hot path when they arrive.
-//   - Real order packets (amt == 24 bytes) are immediately echoed to port 34256.
-//
-// Packet layout (24 bytes, little-endian):
-//   bytes  0– 7  sequence      u64
-//   bytes  8–15  slot          u64
-//   bytes 16–23  order_send_ns u64
+//! `fake-exchange` — standalone matching-engine stand-in for the external
+//! (kernel-path) round-trip measurement.
+//!
+//! Design:
+//!   - Non-blocking spin-poll on the order socket (QOS_CLASS_USER_INTERACTIVE)
+//!     eliminates OS wakeup latency. Without this, every packet arrival costs a
+//!     full thread wakeup (~10–30 µs); with spin-poll the exchange detects the
+//!     packet on the very next recv attempt (~sub-µs).
+//!   - Heartbeat packets (amt < 24 bytes) are silently discarded. They exist only
+//!     to keep this process's socket and kernel networking state warm so real
+//!     order packets find a hot path when they arrive.
+//!   - Real order packets (amt == 24 bytes) are immediately echoed to port 34256.
+//!
+//! Packet layout (24 bytes, little-endian):
+//!   bytes  0– 7  sequence      u64
+//!   bytes  8–15  slot          u64
+//!   bytes 16–23  order_send_ns u64
 
 use std::net::UdpSocket;
 use rust_hft_software::config::{ORDER_ADDR, CONFIRM_ADDR, MIN_ORDER_PACKET_SIZE};

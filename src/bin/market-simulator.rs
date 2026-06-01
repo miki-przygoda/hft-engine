@@ -1,3 +1,11 @@
+//! `market-simulator` — standalone UDP feed generator for external testing.
+//!
+//! Sends `WARMUP_PACKETS` warmup ticks (no delay) followed by `REAL_PACKETS`
+//! ticks at `PACKET_INTERVAL_MS` spacing to the engine's ingestor port. Used
+//! with `fake-exchange` and `trading-engine` to measure the full kernel-path
+//! round trip. The warmup count is shared via `rust_hft_software::config` so it
+//! stays in lock-step with the engine (invariant #9).
+
 use std::net::UdpSocket;
 use std::thread;
 use std::time::Duration;

@@ -1,3 +1,10 @@
+//! `bench-one-threaded` — single-core SIMD throughput ceiling.
+//!
+//! Detects the best available vector ISA at runtime (AVX-512 / AVX2 / SSE on
+//! x86_64, NEON on aarch64), runs ~1 billion float multiplies, and reports
+//! Gops/s. This is the hardware bound the single-threaded trading loop cannot
+//! beat.
+
 use std::arch::asm;
 use std::time::Instant;
 

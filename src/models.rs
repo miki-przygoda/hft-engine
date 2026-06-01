@@ -1,3 +1,13 @@
+//! Core data structures shared across the engine's threads.
+//!
+//! Every cross-thread type here is `#[repr(C, align(64))]` and built around a
+//! lock-free protocol — single-producer/single-consumer (SPSC) ring buffers or
+//! single-writer logs — using `AtomicU64` cursors with `Acquire`/`Release`
+//! ordering. There are no mutexes. The cache-line layout (notably the
+//! `latest_idx` / `start_time` co-location in [`RingBuffer`]) and the
+//! single-writer rules are load-bearing; see the invariants in `CLAUDE.md`
+//! before changing field order or sizes.
+
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
@@ -5,6 +15,13 @@ use std::time::Instant;
 use crate::{BUFFER_SIZE, ORDER_RING_SIZE, TRADE_LOG_SIZE};
 use rust_hft_software::config::MAX_INSTRUMENTS;
 
+/// A single market data tick — exactly one 64-byte cache line.
+///
+/// One tick per cache line means no false sharing and no partial-line loads.
+/// `timestamp` (ns since engine start) is written by the ingestor *before* it
+/// publishes the tick via [`RingBuffer::latest_idx`], so the strategy sees a
+/// consistent value after the matching acquire load. Must stay 64 bytes
+/// (invariant #1) — adjust `_unused` if fields change.
 #[repr(C, align(64))]
 pub(crate) struct MarketTick {
     pub(crate) price:     f32,
@@ -14,6 +31,13 @@ pub(crate) struct MarketTick {
     _unused: [u8; 36],
 }
 
+/// Lock-free SPSC ring buffer delivering ticks from the ingestor to the strategy.
+///
+/// The ingestor is the sole writer of `latest_idx` (publish with `Release`); the
+/// strategy is the sole reader (consume with `Acquire`). `start_time` is
+/// deliberately placed in the *same* cache line as `latest_idx` so that the
+/// strategy's per-iteration cursor load keeps the clock anchor L1-hot for free —
+/// do not insert any field between them (invariants #2, #3).
 #[repr(C, align(64))]
 pub(crate) struct RingBuffer {
     pub(crate) ticks:      [MarketTick; BUFFER_SIZE],
@@ -21,6 +45,12 @@ pub(crate) struct RingBuffer {
     pub(crate) start_time: Instant,    // offset 65544 — same cache line as latest_idx
 }
 
+/// One recorded trade and its latency breakdown (48 bytes, 6 × u64).
+///
+/// The strategy fills every field except `round_trip_ns` and commits the slot;
+/// the exchange thread later fills `round_trip_ns` on that already-committed
+/// slot (invariant #4). The 6-u64 size is assumed by the trade-log pre-touch
+/// loop in `main` (invariant #10).
 #[derive(Copy, Clone)]
 pub(crate) struct TradeExecution {
     pub sequence:       u64,
@@ -31,6 +61,12 @@ pub(crate) struct TradeExecution {
     pub round_trip_ns:  u64,
 }
 
+/// Single-writer lock-free latency log.
+///
+/// Write: fill `entries[write_idx & MASK]`, then `fetch_add(1, Release)` on
+/// `write_idx` to publish. Read: `load(Acquire)` for the committed count, then
+/// read `entries[0..count]`. The strategy is the only thread that advances
+/// `write_idx`.
 pub(crate) struct TradeLog {
     pub(crate) entries:   UnsafeCell<[TradeExecution; TRADE_LOG_SIZE]>,
     pub(crate) write_idx: AtomicU64,
@@ -96,6 +132,10 @@ impl LatencyHistogram {
     }
 }
 
+/// Shared run state: the trade log, both latency histograms, and the run's
+/// bookkeeping atomics (stall/gap counters, the dirty-feed flag, the risk
+/// `halt`/`net_position`, and memory snapshots). One instance is shared by all
+/// threads behind an `Arc`.
 #[repr(C, align(64))]
 pub(crate) struct OrderBook {
     pub(crate) trade_log:    TradeLog,
@@ -158,6 +198,10 @@ unsafe impl Sync for InstrumentBuffers {}
 
 // ────────────────────────────────────────────────────────────────────────────
 
+/// One submitted order on the strategy→exchange ring (64 bytes / one cache line).
+///
+/// `slot` is the trade-log index this order corresponds to, letting the exchange
+/// write `round_trip_ns` back in O(1) without scanning.
 #[repr(C, align(64))]
 pub(crate) struct OrderEntry {
     pub(crate) sequence:      u64,
@@ -166,6 +210,9 @@ pub(crate) struct OrderEntry {
     _pad: [u8; 40],
 }
 
+/// Lock-free SPSC ring carrying orders from the strategy (sole writer) to the
+/// in-process exchange (sole reader). Same publish/consume protocol as
+/// [`TradeLog`]: `fetch_add(Release)` to submit, `load(Acquire)` to detect.
 pub(crate) struct OrderRing {
     pub(crate) entries:   UnsafeCell<[OrderEntry; ORDER_RING_SIZE]>,
     pub(crate) write_idx: AtomicU64,

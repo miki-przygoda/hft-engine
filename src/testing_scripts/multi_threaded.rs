@@ -1,3 +1,9 @@
+//! `bench-multi-threaded` ("The Kraken") — all-core SIMD stress test.
+//!
+//! Progressively ramps up to one worker per core, each grinding ~1 billion NEON
+//! ops, then reports aggregate wall-clock throughput and per-op latency. Built
+//! to push Apple Silicon into thermal territory and measure throughput under it.
+
 use std::arch::asm;
 use std::thread;
 use std::time::{Duration, Instant};
