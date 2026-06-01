@@ -111,10 +111,18 @@ fn main() {
         }
     });
 
-    thread::spawn({
-        let ir = Arc::clone(&ingestor_ready);
-        move || engine::run_market_simulator(ir)
-    });
+    // Internal burst simulator. Skipped when HFT_EXTERNAL_FEED is set, so a real
+    // feed (the kraken-feed adapter, live or replay) can drive the ingestor alone
+    // without synthetic ticks mixing in.
+    let external_feed = std::env::var_os("HFT_EXTERNAL_FEED").is_some();
+    if !external_feed {
+        thread::spawn({
+            let ir = Arc::clone(&ingestor_ready);
+            move || engine::run_market_simulator(ir)
+        });
+    } else {
+        println!("[engine] HFT_EXTERNAL_FEED set — internal simulator disabled, awaiting external feed");
+    }
 
     let strategy = thread::spawn({
         let buf  = Arc::clone(&buffer);

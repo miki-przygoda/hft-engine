@@ -27,3 +27,6 @@ TODOs/
 # MacOS:
 
 .DS_Store
+
+# Local feed captures (regenerate with: kraken-feed --synth, or --record live)
+recordings/
