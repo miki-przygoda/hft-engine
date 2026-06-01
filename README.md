@@ -269,9 +269,12 @@ HFT_TRADE=1 HFT_ADAPTIVE=1 HFT_FEE_BPS=2.6 HFT_LEVERAGE=2 make live PAIR=XBT/USD
 # Fixed bps (you pick the levels — must be within the market's actual range):
 HFT_TRADE=1 HFT_ENTRY_BPS=3 HFT_TP_BPS=10 HFT_SL_BPS=20 make live PAIR=XBT/USD
 
-# Offline, deterministic (mean-reverting sample → reliably profitable):
+# Offline, deterministic (mean-reverting random-walk sample):
 HFT_TRADE=1 HFT_ADAPTIVE=1 make replay
+HFT_TRADE=1 HFT_ADAPTIVE=1 HFT_FEE_BPS=0 make replay   # isolate the gross edge
 ```
+
+On the realistic synth the model shows a real **gross** edge (≈71% win, profit factor ~2) of ~0.4 bps/trade — which a realistic ~5 bps round-trip fee wipes out. That fee sensitivity is the point: micro mean-reversion is a negative-edge game once you pay to cross the spread.
 
 ```
 TRADING SCORECARD  (long&short mean-reversion, 2x leverage, 2.6 bps/side fee)

@@ -556,8 +556,12 @@ book instead of one-sided buy attempts, and scores its P&L.
   `HFT_TP_BPS`, `HFT_SL_BPS`, `HFT_FEE_BPS` (per side), `HFT_LEVERAGE`,
   `HFT_BASE_SIZE`, `HFT_MAX_SIZE_MULT`, `HFT_NO_SHORT`.
 
-The mean-reverting synth capture is reliably profitable; on real data the fee
-(`HFT_FEE_BPS`) is what usually turns a positive gross edge negative.
+`kraken-feed --synth` writes a deterministic **mean-reverting random walk** (OU
+pull + microstructure noise, ~0.7 bps/tick) — a realistic testbed, not the clean
+sine it used to be. On it the model shows a real *gross* edge (~71% win, profit
+factor ~2, ~0.4 bps/trade) that a realistic round-trip fee (`HFT_FEE_BPS`) erases.
+That fee sensitivity — gross edge, net loss — is the honest lesson, and the same
+dynamic you'll see on real data.
 
 ---
 

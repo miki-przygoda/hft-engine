@@ -351,24 +351,40 @@ fn run_replay(path: &str, ingestor: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Fabricate a small capture so the full v2 path can be exercised offline.
+/// Fabricate a deterministic capture for offline testing. The price is a
+/// **mean-reverting random walk with microstructure noise** (Ornstein-Uhlenbeck
+/// pull toward a slowly drifting center + per-tick shocks), so per-tick moves are
+/// a realistic few bps and the model's edge is genuinely uncertain — unlike a
+/// pure sine, which mean-reversion trivially prints money on. Seeded LCG → fully
+/// reproducible. Override the seed with HFT_SYNTH_SEED for a different path.
 fn run_synth(path: &str) -> io::Result<()> {
     let mut rec = Recorder::create(path)?;
-    let n = 600u64;
-    // ~33 ms simulated transit with jitter; a brisk price oscillation (~0.7% swings)
-    // so the breakout signal fires regularly and the report shows real distributions.
+    let n = 2000u64;
+
+    let mut seed: u64 = std::env::var("HFT_SYNTH_SEED").ok()
+        .and_then(|s| s.trim().parse().ok()).unwrap_or(0x5DEECE66D);
+    // Uniform in [-1, 1) from a 48-bit LCG.
+    let mut u = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 16) as f64 / (1u64 << 48) as f64) * 2.0 - 1.0
+    };
+
+    let mut price: f64 = 60_000.0;
+    let mut center: f64 = 60_000.0;
     for seq in 1..=n {
-        let price = 60_000.0_f32 + 400.0_f32 * (seq as f32 * 0.6).sin();
+        center += 1.5 * u();                       // slow random drift of fair value
+        let reversion = (center - price) * 0.05;   // OU pull back toward center
+        let shock = (u() + u() + u()) / 3.0 * 14.0; // ~approx-normal noise, ~2 bps of 60k
+        price += reversion + shock;
+
         let transit = 33_000_000 + (seq.wrapping_mul(2_654_435) % 8_000_000);
         let origin = 1_700_000_000_000_000_000u64.wrapping_add(seq.wrapping_mul(5_000_000));
-        let pkt = build_packet(price, 0.01, seq, origin, transit);
-        // Stuff the inter-arrival delta into the recorder by spacing in real time
-        // is unnecessary; write the records with synthetic deltas directly.
+        let pkt = build_packet(price as f32, 0.01, seq, origin, transit);
         rec.file.write_all(&5_000_000u64.to_le_bytes())?; // 5 ms apart
         rec.file.write_all(&(pkt.len() as u16).to_le_bytes())?;
         rec.file.write_all(&pkt)?;
     }
-    println!("[kraken-feed] wrote {n} synthetic packets to {path}");
+    println!("[kraken-feed] wrote {n} synthetic packets (mean-reverting random walk) to {path}");
     Ok(())
 }
 
