@@ -39,4 +39,35 @@ pub mod config {
     // Multi-instrument scaffold (item 8).
     // Pre-allocated ring buffer slots; index by compact instrument ID (0-based).
     pub const MAX_INSTRUMENTS: usize = 8;
+
+    // ── Live feed (kraken-feed adapter) ─────────────────────────────────────
+    //
+    // The v2 market-data packet is 32 bytes (LE). The first 16 bytes are
+    // byte-identical to the legacy 16-byte packet (price f32, volume f32,
+    // sequence u64) so old senders keep working; the extra 16 bytes carry the
+    // exchange origin timestamp and the RTT/2 transit estimate:
+    //   [ 0.. 4] price f32      [ 4.. 8] volume f32     [ 8..16] sequence u64
+    //   [16..24] origin_ts_ns   [24..32] transit_est_ns
+    // The ingestor parses the extra fields only when it receives >= 32 bytes.
+    pub const INGEST_PACKET_SIZE_V2: usize = 32;
+
+    // Kraken WebSocket v1 feed. TLS is terminated by a local stunnel instance
+    // (STUNNEL_ADDR → KRAKEN_HOST:443); the adapter speaks plaintext TCP to
+    // stunnel and never links a TLS library (zero-dependency invariant #13).
+    pub const KRAKEN_HOST:  &str = "ws.kraken.com";
+    pub const KRAKEN_PAIR:  &str = "XBT/USD";
+    pub const STUNNEL_ADDR: &str = "127.0.0.1:8443";
+
+    // RTT probe cadence: how often the adapter sends a WebSocket ping to refresh
+    // its RTT/2 one-way transit estimate.
+    pub const RTT_PING_INTERVAL_MS: u64 = 1000;
+
+    // Default path for the record/replay capture file (relative to cwd).
+    pub const RECORD_PATH_DEFAULT: &str = "recordings/kraken.krkr";
+
+    // Buy-signal threshold in basis points above the 8-tick window (item: real
+    // signal). The strategy triggers when current price exceeds the window
+    // reference by this fraction. 10 bps = 0.10%. Loaded once at startup into
+    // the SIMD scale constant; see trading_strategy in engine.rs.
+    pub const SIGNAL_MOMENTUM_BPS: u64 = 10;
 }

@@ -67,7 +67,7 @@ fn main() {
             std::ptr::write_volatile(ring.add(i), 0);
         }
         let log = (*order_book.trade_log.entries.get()).as_ptr() as *mut u64;
-        for i in (0..TRADE_LOG_SIZE * 6).step_by(6) {
+        for i in (0..TRADE_LOG_SIZE * 7).step_by(7) {  // TradeExecution = 7 × u64 (invariant #10)
             std::ptr::write_volatile(log.add(i), 0);
         }
     }

@@ -22,13 +22,20 @@ use rust_hft_software::config::MAX_INSTRUMENTS;
 /// publishes the tick via [`RingBuffer::latest_idx`], so the strategy sees a
 /// consistent value after the matching acquire load. Must stay 64 bytes
 /// (invariant #1) — adjust `_unused` if fields change.
+///
+/// `origin_ts_ns` and `transit_est_ns` carry live-feed metadata from the v2
+/// packet (see `config::INGEST_PACKET_SIZE_V2`). They sit in what used to be
+/// padding, so the struct is still exactly 64 bytes and the first 16 bytes are
+/// still price/volume/sequence — legacy 16-byte packets leave both fields zero.
 #[repr(C, align(64))]
 pub(crate) struct MarketTick {
-    pub(crate) price:     f32,
-    pub(crate) volume:    f32,
-    pub(crate) sequence:  u64,
-    pub(crate) timestamp: u64,
-    _unused: [u8; 36],
+    pub(crate) price:          f32,  // offset  0
+    pub(crate) volume:         f32,  // offset  4
+    pub(crate) sequence:       u64,  // offset  8
+    pub(crate) timestamp:      u64,  // offset 16 — ingest time (ns since engine start)
+    pub(crate) origin_ts_ns:   u64,  // offset 24 — exchange trade time (ns since epoch)
+    pub(crate) transit_est_ns: u64,  // offset 32 — RTT/2 one-way transit estimate
+    _unused: [u8; 20],               // offset 40 — padding to 64 bytes
 }
 
 /// Lock-free SPSC ring buffer delivering ticks from the ingestor to the strategy.
@@ -45,21 +52,32 @@ pub(crate) struct RingBuffer {
     pub(crate) start_time: Instant,    // offset 65544 — same cache line as latest_idx
 }
 
-/// One recorded trade and its latency breakdown (48 bytes, 6 × u64).
+/// One recorded trade and its full-stack latency breakdown (56 bytes, 7 × u64).
 ///
 /// The strategy fills every field except `round_trip_ns` and commits the slot;
 /// the exchange thread later fills `round_trip_ns` on that already-committed
-/// slot (invariant #4). The 6-u64 size is assumed by the trade-log pre-touch
+/// slot (invariant #4). The 7-u64 size is assumed by the trade-log pre-touch
 /// loop in `main` (invariant #10).
+///
+/// `transit_est_ns` (RTT/2 from the live feed) is copied from the tick at trade
+/// time so the per-trade end-to-end latency (transit + signal + round trip) can
+/// be reconstructed at shutdown even after the ring slot is overwritten.
 #[derive(Copy, Clone)]
 pub(crate) struct TradeExecution {
     pub sequence:       u64,
     pub ingest_time_ns: u64,
     pub buy_time_ns:    u64,
-    pub latency_ns:     u64,
+    pub latency_ns:     u64,   // signal latency: buy_time_ns - ingest_time_ns
     pub order_send_ns:  u64,
-    pub round_trip_ns:  u64,
+    pub round_trip_ns:  u64,   // written by exchange thread
+    pub transit_est_ns: u64,   // RTT/2 transit estimate, copied from the tick
 }
+
+// Layout invariants, checked at compile time.
+//   #1:  MarketTick stays exactly 64 bytes (one cache line; pre-touch step = 8).
+//   #10: TradeExecution stays 56 bytes / 7 × u64 (pre-touch step = 7 in main.rs).
+const _: () = assert!(std::mem::size_of::<MarketTick>() == 64);
+const _: () = assert!(std::mem::size_of::<TradeExecution>() == 56);
 
 /// Single-writer lock-free latency log.
 ///
