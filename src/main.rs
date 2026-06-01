@@ -60,12 +60,19 @@ fn main() {
         leverage:      env_f32("HFT_LEVERAGE",   rust_hft_software::config::LEVERAGE_DEFAULT),
         base_size:     env_f32("HFT_BASE_SIZE",  rust_hft_software::config::BASE_SIZE_DEFAULT),
         max_size_mult: env_f32("HFT_MAX_SIZE_MULT", rust_hft_software::config::MAX_SIZE_MULT_DEFAULT),
+        adaptive:      std::env::var_os("HFT_ADAPTIVE").is_some(),
     };
 
     if trade_cfg.enabled {
-        println!("[engine] TRADING model: {} mean-reversion  entry {:.1}bps  TP {:.1}bps  SL {:.1}bps  fee {:.1}bps/side  lev {:.0}x",
-            if trade_cfg.allow_short { "long&short" } else { "long-only" },
-            trade_cfg.entry_dip_bps, trade_cfg.tp_bps, trade_cfg.sl_bps, trade_cfg.fee_bps, trade_cfg.leverage);
+        if trade_cfg.adaptive {
+            println!("[engine] TRADING model: {} mean-reversion, ADAPTIVE (entry 1σ / TP 1.5σ / SL 2.5σ)  fee {:.1}bps/side  lev {:.0}x",
+                if trade_cfg.allow_short { "long&short" } else { "long-only" },
+                trade_cfg.fee_bps, trade_cfg.leverage);
+        } else {
+            println!("[engine] TRADING model: {} mean-reversion  entry {:.1}bps  TP {:.1}bps  SL {:.1}bps  fee {:.1}bps/side  lev {:.0}x",
+                if trade_cfg.allow_short { "long&short" } else { "long-only" },
+                trade_cfg.entry_dip_bps, trade_cfg.tp_bps, trade_cfg.sl_bps, trade_cfg.fee_bps, trade_cfg.leverage);
+        }
     } else if buy_on_downtick {
         println!("[engine] downtick mode: buy on any price decrease");
     } else if target_dip_bps > 0.0 {
@@ -101,6 +108,7 @@ fn main() {
         buy_on_downtick,
         trade_cfg,
         round_trips:   models::RoundTripLog::new(),
+        vol_ema_bits:  AtomicU32::new(0),
     });
 
     let order_ring = Arc::new(models::OrderRing::new());

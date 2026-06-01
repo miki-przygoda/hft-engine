@@ -167,6 +167,7 @@ pub(crate) struct TradeCfg {
     pub leverage:      f32,
     pub base_size:     f32,   // base position size in base-currency units
     pub max_size_mult: f32,   // cap on dynamic size scaling
+    pub adaptive:      bool,  // entry/TP/SL as multiples of rolling volatility
 }
 
 /// One completed round-trip (entry → exit), the unit of the P&L scorecard.
@@ -243,6 +244,7 @@ pub(crate) struct OrderBook {
     // ── Trading model (HFT_TRADE) ───────────────────────────────────────────
     pub(crate) trade_cfg:   TradeCfg,        // set once by main
     pub(crate) round_trips: RoundTripLog,    // completed round-trips; sole writer: strategy
+    pub(crate) vol_ema_bits: AtomicU32,      // final rolling volatility est (f32 bps bits); writer: strategy
 }
 
 // ── Multi-instrument scaffold (item 8) ──────────────────────────────────────

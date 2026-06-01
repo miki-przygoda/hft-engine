@@ -683,12 +683,16 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
         let rts_all = unsafe { &*order_book.round_trips.entries.get() };
         let rts = &rts_all[..rt_count];
         let cfg = order_book.trade_cfg;
+        let vol = f32::from_bits(order_book.vol_ema_bits.load(Ordering::Relaxed));
         println!("{}", "─".repeat(72));
-        println!("TRADING SCORECARD  ({} mean-reversion, {:.0}x leverage, {:.1} bps/side fee)",
-                 if cfg.allow_short { "long&short" } else { "long-only" }, cfg.leverage, cfg.fee_bps);
+        let rule = if cfg.adaptive { "ADAPTIVE (entry 1σ/TP 1.5σ/SL 2.5σ)".to_string() }
+                   else { format!("entry {:.1}/TP {:.1}/SL {:.1} bps", cfg.entry_dip_bps, cfg.tp_bps, cfg.sl_bps) };
+        println!("TRADING SCORECARD  ({} mean-reversion, {}, {:.0}x lev, {:.1} bps/side fee)",
+                 if cfg.allow_short { "long&short" } else { "long-only" }, rule, cfg.leverage, cfg.fee_bps);
         if lo.is_finite() && hi.is_finite() {
             let range_bps = if lo > 0.0 { (hi - lo) / lo * 10_000.0 } else { 0.0 };
-            println!("Observed price range: [{:.2}, {:.2}]  ({:.1} bps span)", lo, hi, range_bps);
+            println!("Observed price range: [{:.2}, {:.2}]  ({:.1} bps span)  |  volatility ~{:.2} bps/tick",
+                     lo, hi, range_bps, vol);
         }
         match scorecard(rts) {
             Some(s) => {
@@ -1143,6 +1147,14 @@ pub(crate) unsafe fn trading_strategy(
         let mut entry_price: f32 = 0.0;
         let mut entry_time:  u64 = 0;
         let mut pos_size:    f32 = 0.0;
+        // Rolling volatility (EMA of |per-tick return| in bps). In adaptive mode the
+        // entry/TP/SL thresholds are multiples of this, so they auto-scale to the
+        // market instead of being fixed bps that may exceed the whole range.
+        const VOL_ALPHA:  f32 = 1.0 / 32.0;
+        const VOL_FLOOR:  f32 = 0.1;   // bps; avoids zero thresholds on a frozen tape
+        let mut vol_ema:  f32 = 0.0;
+        let mut vol_prev: f32 = 0.0;
+        let mut vol_init: bool = false;
 
         // Pending simulated fills (FIFO ring). When we send an order we don't know
         // the fill price yet — it's the market price one transit later. Each entry
@@ -1434,7 +1446,26 @@ pub(crate) unsafe fn trading_strategy(
                     // scaled by leverage. (The latency slippage is reported separately.)
                     if tcfg.enabled {
                         if !ref_init { ref_px = price; ref_init = true; }
-                        let dip   = tcfg.entry_dip_bps / 10_000.0;
+
+                        // Rolling volatility estimate (bps/tick).
+                        if vol_init {
+                            let ret = ((price - vol_prev) / vol_prev * 10_000.0).abs();
+                            vol_ema += (ret - vol_ema) * VOL_ALPHA;
+                        } else {
+                            vol_init = true;
+                        }
+                        vol_prev = price;
+                        order_book.vol_ema_bits.store(vol_ema.to_bits(), Ordering::Relaxed);
+
+                        // Effective thresholds: adaptive (σ multiples) or fixed bps.
+                        let (entry_bps, tp_bps, sl_bps) = if tcfg.adaptive {
+                            let s = vol_ema.max(VOL_FLOOR);
+                            (s * 1.0, s * 1.5, s * 2.5)
+                        } else {
+                            (tcfg.entry_dip_bps, tcfg.tp_bps, tcfg.sl_bps)
+                        };
+
+                        let dip   = entry_bps / 10_000.0;
                         let lo_th = ref_px * (1.0 - dip);
                         let hi_th = ref_px * (1.0 + dip);
                         let long_sig  = price <= lo_th;
@@ -1451,7 +1482,7 @@ pub(crate) unsafe fn trading_strategy(
                                     let depth_frac = if dir == 1 { (ref_px - price) / ref_px }
                                                      else { (price - ref_px) / ref_px };
                                     let depth_bps = depth_frac * 10_000.0;
-                                    let mult = (depth_bps / tcfg.entry_dip_bps).clamp(1.0, tcfg.max_size_mult);
+                                    let mult = (depth_bps / entry_bps.max(VOL_FLOOR)).clamp(1.0, tcfg.max_size_mult);
                                     pos_size    = tcfg.base_size * mult;
                                     entry_price = price;
                                     entry_time  = tick_now_ns;
@@ -1464,7 +1495,7 @@ pub(crate) unsafe fn trading_strategy(
                                 let move_bps = (price - entry_price) / entry_price
                                     * 10_000.0 * pos_side as f32;
                                 let opp = if pos_side == 1 { short_sig } else { long_sig };
-                                if move_bps >= tcfg.tp_bps || move_bps <= -tcfg.sl_bps || opp {
+                                if move_bps >= tp_bps || move_bps <= -sl_bps || opp {
                                     let gross_bps  = move_bps;
                                     let net_bps    = gross_bps - 2.0 * tcfg.fee_bps;
                                     let notional   = pos_size * entry_price * tcfg.leverage;

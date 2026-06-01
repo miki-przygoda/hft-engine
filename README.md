@@ -261,11 +261,16 @@ Each order's fill is the market price *one transit (RTT/2) later*, so the report
 `HFT_TRADE=1` turns the engine into a **long & short mean-reversion** model: it buys small dips / shorts small rips against a rolling reference, sizes up dynamically on bigger dislocations, and exits on **take-profit / stop-loss / opposite signal**. At shutdown it prints a P&L scorecard — round-trips, win rate, net P&L (bps & quote), profit factor, max drawdown, Sharpe, avg hold — **net of fees and scaled by leverage**:
 
 ```bash
-HFT_TRADE=1 HFT_ENTRY_BPS=3 HFT_TP_BPS=10 HFT_SL_BPS=20 \
-  HFT_FEE_BPS=2.6 HFT_LEVERAGE=2 make live PAIR=XBT/USD
+# ADAPTIVE (recommended): thresholds auto-scale to realized volatility (entry 1σ /
+# TP 1.5σ / SL 2.5σ), so it fires in any regime — no guessing bps against a market
+# that might only move a fraction of your threshold.
+HFT_TRADE=1 HFT_ADAPTIVE=1 HFT_FEE_BPS=2.6 HFT_LEVERAGE=2 make live PAIR=XBT/USD
+
+# Fixed bps (you pick the levels — must be within the market's actual range):
+HFT_TRADE=1 HFT_ENTRY_BPS=3 HFT_TP_BPS=10 HFT_SL_BPS=20 make live PAIR=XBT/USD
 
 # Offline, deterministic (mean-reverting sample → reliably profitable):
-HFT_TRADE=1 make replay
+HFT_TRADE=1 HFT_ADAPTIVE=1 make replay
 ```
 
 ```

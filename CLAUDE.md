@@ -536,6 +536,11 @@ book instead of one-sided buy attempts, and scores its P&L.
   where `ref` is the EMA reference (`α = 1/64`). Position **size scales with the dip
   depth** (`depth/entry_bps`, clamped to `max_size_mult`) — the "dynamic, maximise
   output" lever. `HFT_NO_SHORT` makes it long-only.
+- **Adaptive thresholds** (`HFT_ADAPTIVE=1`): instead of fixed bps, entry/TP/SL are
+  multiples of a rolling volatility estimate (EMA of |per-tick return|): entry 1σ,
+  TP 1.5σ, SL 2.5σ. This auto-calibrates to whatever the market is doing, so it
+  fires in flat tapes too — the honest result being that micro-moves rarely beat
+  the fee. The scorecard reports the realized σ (bps/tick).
 - **Exit:** take-profit (`+tp_bps`), stop-loss (`−sl_bps`), or the opposite signal,
   whichever comes first. Fills at the observed price; latency slippage is reported
   separately (it's ~sub-bp, dwarfed by the fee).
