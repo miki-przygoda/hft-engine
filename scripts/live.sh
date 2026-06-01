@@ -34,9 +34,27 @@ ST=""; ENG=""; FEED=""
 cleanup() { for p in "$FEED" "$ENG" "$ST"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
+STLOG="recordings/stunnel.log"
 echo "[live] starting stunnel ($STUNNEL) → ws.kraken.com:443 (127.0.0.1:8443)…"
-"$STUNNEL" docs/stunnel.conf & ST=$!
-sleep 1
+"$STUNNEL" docs/stunnel.conf >"$STLOG" 2>&1 & ST=$!
+
+# Wait up to ~5s for the listener — or detect that stunnel died at startup.
+up=""
+for _ in $(seq 1 50); do
+  kill -0 "$ST" 2>/dev/null || break
+  if bash -c "exec 3<>/dev/tcp/127.0.0.1/8443" 2>/dev/null; then up=1; break; fi
+  sleep 0.1
+done
+if [ -z "$up" ]; then
+  echo "[live] ERROR: stunnel never started listening on 127.0.0.1:8443. Its log:"
+  echo "----------------------------------------------------------------"
+  cat "$STLOG" 2>/dev/null || true
+  echo "----------------------------------------------------------------"
+  echo "Most common cause: cert verification. Ensure docs/stunnel.conf has"
+  echo "'verifyChain = no' (default), or set a valid CAfile/CApath for 'yes'."
+  exit 1
+fi
+echo "[live] stunnel listening on 127.0.0.1:8443"
 
 echo "[live] starting engine (HFT_EXTERNAL_FEED=1)…"
 HFT_EXTERNAL_FEED=1 $SUDO ./target/release/trading-engine & ENG=$!
