@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::{models, BUFFER_SIZE, ORDER_RING_SIZE, TRADE_LOG_SIZE};
+use crate::{models, BUFFER_SIZE, ORDER_RING_SIZE, ROUND_TRIP_LOG_SIZE, TRADE_LOG_SIZE};
 use rust_hft_software::config::{
     BURST_GAP_MS, BURST_SIZE, CLEAN_SEQ_THRESHOLD, INGESTOR_ADDR,
     MAX_GAP_COUNT, MAX_POSITION, NUM_BURSTS, SIGNAL_MOMENTUM_BPS, WARMUP_PACKETS,
@@ -235,6 +235,47 @@ fn halt_trading(order_book: &models::OrderBook, reason: &str) {
 /// received tick into the [`RingBuffer`](models::RingBuffer). Stamps every tick
 /// with an ingest timestamp and flags sequence gaps via the `dirty` flag. Sole
 /// writer of `latest_idx`.
+// Emit an order for latency accounting (used by the trading model on each entry
+// and exit). Records signal latency, writes a TradeExecution (target/fill left 0
+// so it is excluded from the slippage stats — P&L is tracked via round-trips), and
+// pushes the order ring so the exchange thread fills in the round-trip time.
+#[inline(always)]
+unsafe fn emit_latency_order(
+    buffer: &models::RingBuffer,
+    order_book: &models::OrderBook,
+    order_ring: &models::OrderRing,
+    current_seq: u64,
+    ingest_time_ns: u64,
+    transit_est_ns: u64,
+) {
+    unsafe {
+        let buy_time_ns = elapsed_ns(&buffer.start_time);
+        let latency_ns  = buy_time_ns.saturating_sub(ingest_time_ns);
+        order_book.sig_hist.record(latency_ns);
+
+        let slot = order_book.trade_log.write_idx.load(Ordering::Relaxed) as usize & TRADE_LOG_MASK;
+        let entry = &mut (*order_book.trade_log.entries.get())[slot];
+        let order_send_ns = elapsed_ns(&buffer.start_time);
+        entry.sequence       = current_seq;
+        entry.ingest_time_ns = ingest_time_ns;
+        entry.buy_time_ns    = buy_time_ns;
+        entry.latency_ns     = latency_ns;
+        entry.order_send_ns  = order_send_ns;
+        entry.round_trip_ns  = 0;
+        entry.transit_est_ns = transit_est_ns;
+        entry.target_price   = 0.0;
+        entry.fill_price     = 0.0;
+        order_book.trade_log.write_idx.fetch_add(1, Ordering::Release);
+
+        let ring_slot = order_ring.write_idx.load(Ordering::Relaxed) as usize & ORDER_RING_MASK;
+        let oe = &mut (*order_ring.entries.get())[ring_slot];
+        oe.sequence      = current_seq;
+        oe.slot          = slot as u64;
+        oe.order_send_ns = order_send_ns;
+        order_ring.write_idx.fetch_add(1, Ordering::Release);
+    }
+}
+
 pub(crate) fn run_ingestor(
     buffer: Arc<models::RingBuffer>,
     order_book: Arc<models::OrderBook>,
@@ -495,6 +536,56 @@ fn summarize_slippage(v: Vec<f64>) -> Option<SlipStat> {
     Some(SlipStat { mean, min, max, abs_p50: pick(50), abs_p95: pick(95), n })
 }
 
+// P&L scorecard computed from the completed round-trips at shutdown.
+struct Scorecard {
+    n: usize, wins: usize, losses: usize, longs: usize, shorts: usize,
+    win_rate: f64,
+    total_pnl: f64, total_fees: f64,
+    gross_bps_mean: f64, net_bps_mean: f64,
+    avg_win_bps: f64, avg_loss_bps: f64,
+    profit_factor: f64, max_drawdown: f64, sharpe: f64, avg_hold_ms: f64,
+}
+
+fn scorecard(rts: &[models::RoundTrip]) -> Option<Scorecard> {
+    if rts.is_empty() { return None; }
+    let n = rts.len();
+    let (mut wins, mut losses, mut longs, mut shorts) = (0usize, 0usize, 0usize, 0usize);
+    let (mut total_pnl, mut total_fees) = (0.0f64, 0.0f64);
+    let (mut gross_sum, mut net_sum) = (0.0f64, 0.0f64);
+    let (mut win_bps_sum, mut loss_bps_sum) = (0.0f64, 0.0f64);
+    let (mut win_pnl, mut loss_pnl, mut hold_sum) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut equity, mut peak, mut maxdd) = (0.0f64, 0.0f64, 0.0f64);
+    let mut nets: Vec<f64> = Vec::with_capacity(n);
+    for t in rts {
+        let net = t.net_bps as f64;
+        net_sum += net; gross_sum += t.gross_bps as f64;
+        total_pnl += t.pnl_quote as f64; total_fees += t.fees_quote as f64;
+        hold_sum += t.hold_ns as f64;
+        if t.side > 0 { longs += 1; } else { shorts += 1; }
+        if net > 0.0 { wins += 1; win_bps_sum += net; win_pnl += t.pnl_quote as f64; }
+        else { losses += 1; loss_bps_sum += net; loss_pnl += t.pnl_quote as f64; }
+        nets.push(net);
+        equity += t.pnl_quote as f64;
+        if equity > peak { peak = equity; }
+        if peak - equity > maxdd { maxdd = peak - equity; }
+    }
+    let mean = net_sum / n as f64;
+    let std = (nets.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64).sqrt();
+    Some(Scorecard {
+        n, wins, losses, longs, shorts,
+        win_rate: wins as f64 / n as f64 * 100.0,
+        total_pnl, total_fees,
+        gross_bps_mean: gross_sum / n as f64, net_bps_mean: mean,
+        avg_win_bps:  if wins   > 0 { win_bps_sum  / wins as f64 }   else { 0.0 },
+        avg_loss_bps: if losses > 0 { loss_bps_sum / losses as f64 } else { 0.0 },
+        profit_factor: if loss_pnl < 0.0 { win_pnl / -loss_pnl }
+                       else if win_pnl > 0.0 { f64::INFINITY } else { 0.0 },
+        max_drawdown: maxdd,
+        sharpe: if std > 0.0 { mean / std } else { 0.0 },
+        avg_hold_ms: hold_sum / n as f64 / 1e6,
+    })
+}
+
 fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
     let count  = (order_book.trade_log.write_idx.load(Ordering::Acquire) as usize).min(TRADE_LOG_SIZE);
     let trades = unsafe { &*order_book.trade_log.entries.get() };
@@ -582,12 +673,59 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
         }
     }
 
+    let lo = f32::from_bits(order_book.price_lo_bits.load(Ordering::Relaxed));
+    let hi = f32::from_bits(order_book.price_hi_bits.load(Ordering::Relaxed));
+
+    // ── Trading scorecard (HFT_TRADE) ───────────────────────────────────
+    if order_book.trade_cfg.enabled {
+        let rt_count = (order_book.round_trips.write_idx.load(Ordering::Acquire) as usize)
+            .min(ROUND_TRIP_LOG_SIZE);
+        let rts_all = unsafe { &*order_book.round_trips.entries.get() };
+        let rts = &rts_all[..rt_count];
+        let cfg = order_book.trade_cfg;
+        println!("{}", "─".repeat(72));
+        println!("TRADING SCORECARD  ({} mean-reversion, {:.0}x leverage, {:.1} bps/side fee)",
+                 if cfg.allow_short { "long&short" } else { "long-only" }, cfg.leverage, cfg.fee_bps);
+        if lo.is_finite() && hi.is_finite() {
+            let range_bps = if lo > 0.0 { (hi - lo) / lo * 10_000.0 } else { 0.0 };
+            println!("Observed price range: [{:.2}, {:.2}]  ({:.1} bps span)", lo, hi, range_bps);
+        }
+        match scorecard(rts) {
+            Some(s) => {
+                println!("Round-trips: {}  ({} long / {} short)  |  win rate {:.1}%  ({}W / {}L)",
+                         s.n, s.longs, s.shorts, s.win_rate, s.wins, s.losses);
+                println!("Net P&L: {:+.2} quote   (gross {:+.2} bps/trade, net {:+.2} bps/trade after fees)",
+                         s.total_pnl, s.gross_bps_mean, s.net_bps_mean);
+                println!("Avg win {:+.2} bps  |  avg loss {:+.2} bps  |  profit factor {:.2}",
+                         s.avg_win_bps, s.avg_loss_bps, s.profit_factor);
+                println!("Max drawdown {:.2} quote  |  Sharpe(/trade) {:.2}  |  fees paid {:.2}  |  avg hold {:.1} ms",
+                         s.max_drawdown, s.sharpe, s.total_fees, s.avg_hold_ms);
+                let verdict = if s.total_pnl > 0.0 { "net PROFITABLE" } else { "net LOSS" };
+                println!("→ Model is {verdict} after fees over this run.");
+            }
+            None => println!("No round-trips closed (try a busier pair, longer run, or smaller HFT_ENTRY_BPS)."),
+        }
+
+        let stall_count  = order_book.stall_count.load(Ordering::Relaxed);
+        let gap_count    = order_book.gap_count.load(Ordering::Relaxed);
+        let net_position = order_book.net_position.load(Ordering::Relaxed);
+        let halted       = order_book.halt.load(Ordering::Relaxed);
+        println!("{}", "─".repeat(72));
+        println!("OS stalls (>500ns spin gap): {}  |  Sequence gaps: {}  |  Net position: {}  |  Halt: {}",
+                 stall_count, gap_count, net_position, halted);
+        let _ = std::io::stdout().flush();
+        let total_ram_mb   = order_book.mem_total_ram.load(Ordering::Relaxed) / 1_048_576;
+        let rss_pre_log_mb = mem_pre_log.peak_rss / 1_048_576;
+        println!("{}", "─".repeat(72));
+        println!("Memory — Total RAM: {} MB  |  Peak RSS: {} MB", total_ram_mb, rss_pre_log_mb);
+        let _ = std::io::stdout().flush();
+        return;
+    }
+
     // ── Execution / slippage ────────────────────────────────────────────
     let attempts = order_book.attempts.load(Ordering::Relaxed);
     let filled   = order_book.filled.load(Ordering::Relaxed);
     let pending  = attempts.saturating_sub(filled);
-    let lo = f32::from_bits(order_book.price_lo_bits.load(Ordering::Relaxed));
-    let hi = f32::from_bits(order_book.price_hi_bits.load(Ordering::Relaxed));
     println!("{}", "─".repeat(72));
     if order_book.buy_on_downtick {
         println!("Downtick buys  |  attempts: {}  filled: {}  pending: {}  (slippage vs the price we acted on)",
@@ -778,6 +916,53 @@ fn write_log(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
         None => json.push_str("  \"slippage_bps\": null,\n"),
     }
 
+    // Trading scorecard + equity curve (HFT_TRADE).
+    if order_book.trade_cfg.enabled {
+        let rt_count = (order_book.round_trips.write_idx.load(Ordering::Acquire) as usize)
+            .min(ROUND_TRIP_LOG_SIZE);
+        let rts_all = unsafe { &*order_book.round_trips.entries.get() };
+        let rts = &rts_all[..rt_count];
+        let cfg = order_book.trade_cfg;
+        json.push_str("  \"trading\": {\n");
+        json.push_str(&format!("    \"enabled\": true, \"allow_short\": {}, \"leverage\": {}, \"fee_bps\": {},\n",
+            cfg.allow_short, cfg.leverage, cfg.fee_bps));
+        json.push_str(&format!("    \"entry_dip_bps\": {}, \"tp_bps\": {}, \"sl_bps\": {},\n",
+            cfg.entry_dip_bps, cfg.tp_bps, cfg.sl_bps));
+        match scorecard(rts) {
+            Some(s) => {
+                json.push_str(&format!("    \"round_trips\": {}, \"wins\": {}, \"losses\": {}, \"longs\": {}, \"shorts\": {},\n",
+                    s.n, s.wins, s.losses, s.longs, s.shorts));
+                json.push_str(&format!("    \"win_rate_pct\": {:.2}, \"net_pnl_quote\": {:.4}, \"total_fees_quote\": {:.4},\n",
+                    s.win_rate, s.total_pnl, s.total_fees));
+                json.push_str(&format!("    \"gross_bps_mean\": {:.4}, \"net_bps_mean\": {:.4}, \"avg_win_bps\": {:.4}, \"avg_loss_bps\": {:.4},\n",
+                    s.gross_bps_mean, s.net_bps_mean, s.avg_win_bps, s.avg_loss_bps));
+                let pf = if s.profit_factor.is_finite() { format!("{:.4}", s.profit_factor) } else { "null".to_string() };
+                json.push_str(&format!("    \"profit_factor\": {}, \"max_drawdown_quote\": {:.4}, \"sharpe_per_trade\": {:.4}, \"avg_hold_ms\": {:.3}\n",
+                    pf, s.max_drawdown, s.sharpe, s.avg_hold_ms));
+            }
+            None => json.push_str("    \"round_trips\": 0\n"),
+        }
+        json.push_str("  },\n");
+
+        // Equity curve (cumulative net P&L per round-trip) + the round-trip array.
+        json.push_str("  \"equity_curve\": [");
+        let mut eq = 0.0f64;
+        for (i, t) in rts.iter().enumerate() {
+            eq += t.pnl_quote as f64;
+            json.push_str(&format!("{}{:.4}", if i > 0 { ", " } else { "" }, eq));
+        }
+        json.push_str("],\n");
+
+        json.push_str("  \"round_trip_log\": [\n");
+        for (i, t) in rts.iter().enumerate() {
+            let comma = if i + 1 < rt_count { "," } else { "" };
+            json.push_str(&format!(
+                "    {{\"side\": {}, \"entry_price\": {}, \"exit_price\": {}, \"size\": {}, \"gross_bps\": {:.4}, \"net_bps\": {:.4}, \"pnl_quote\": {:.4}, \"hold_ns\": {}}}{}\n",
+                t.side, t.entry_price, t.exit_price, t.size, t.gross_bps, t.net_bps, t.pnl_quote, t.hold_ns, comma));
+        }
+        json.push_str("  ],\n");
+    }
+
     json.push_str("  \"trades\": [\n");
     for (i, t) in trades[..count].iter().enumerate() {
         let rt = if t.round_trip_ns > 0 { t.round_trip_ns.to_string() } else { "null".to_string() };
@@ -950,6 +1135,14 @@ pub(crate) unsafe fn trading_strategy(
         let use_downtick = order_book.buy_on_downtick;
         let mut prev_px:   f32  = 0.0;
         let mut prev_init: bool = false;
+
+        // ── Trading model state (HFT_TRADE) ─────────────────────────────────
+        let tcfg = order_book.trade_cfg;
+        const RT_MASK: usize = ROUND_TRIP_LOG_SIZE - 1;
+        let mut pos_side:    i64 = 0;    // 0 flat, +1 long, -1 short
+        let mut entry_price: f32 = 0.0;
+        let mut entry_time:  u64 = 0;
+        let mut pos_size:    f32 = 0.0;
 
         // Pending simulated fills (FIFO ring). When we send an order we don't know
         // the fill price yet — it's the market price one transit later. Each entry
@@ -1145,7 +1338,9 @@ pub(crate) unsafe fn trading_strategy(
                     // mode), or the SIMD breakout (default). The breakout asm runs
                     // either way to keep the window warm; its result is just ignored
                     // in target mode.
-                    let trigger = if use_downtick {
+                    let trigger = if tcfg.enabled {
+                        false   // trade mode runs its own entry/exit machine below
+                    } else if use_downtick {
                         let fire = prev_init && price < prev_px;
                         prev_px = price;
                         prev_init = true;
@@ -1227,6 +1422,76 @@ pub(crate) unsafe fn trading_strategy(
                                         pend_due[pi]  = due;
                                         p_tail += 1;
                                     }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Trading model: long & short mean-reversion ──────────────
+                    // Enter on a dip/rip vs a rolling EMA reference; exit on
+                    // take-profit, stop-loss, or the opposite signal. Fills at the
+                    // observed price; P&L is recorded per round-trip, net of fees and
+                    // scaled by leverage. (The latency slippage is reported separately.)
+                    if tcfg.enabled {
+                        if !ref_init { ref_px = price; ref_init = true; }
+                        let dip   = tcfg.entry_dip_bps / 10_000.0;
+                        let lo_th = ref_px * (1.0 - dip);
+                        let hi_th = ref_px * (1.0 + dip);
+                        let long_sig  = price <= lo_th;
+                        let short_sig = price >= hi_th;
+                        ref_px += (price - ref_px) * EMA_ALPHA;
+
+                        if current_seq > WARMUP_PACKETS {
+                            if pos_side == 0 {
+                                let dir: i64 = if long_sig { 1 }
+                                    else if short_sig && tcfg.allow_short { -1 }
+                                    else { 0 };
+                                if dir != 0 && !order_book.halt.load(Ordering::Relaxed) {
+                                    // Dynamic size: scale with the depth of the dislocation, capped.
+                                    let depth_frac = if dir == 1 { (ref_px - price) / ref_px }
+                                                     else { (price - ref_px) / ref_px };
+                                    let depth_bps = depth_frac * 10_000.0;
+                                    let mult = (depth_bps / tcfg.entry_dip_bps).clamp(1.0, tcfg.max_size_mult);
+                                    pos_size    = tcfg.base_size * mult;
+                                    entry_price = price;
+                                    entry_time  = tick_now_ns;
+                                    pos_side    = dir;
+                                    order_book.net_position.fetch_add(dir, Ordering::Relaxed);
+                                    emit_latency_order(buffer, order_book, order_ring,
+                                        current_seq, tick_now_ns, tick_ptr.transit_est_ns);
+                                }
+                            } else {
+                                let move_bps = (price - entry_price) / entry_price
+                                    * 10_000.0 * pos_side as f32;
+                                let opp = if pos_side == 1 { short_sig } else { long_sig };
+                                if move_bps >= tcfg.tp_bps || move_bps <= -tcfg.sl_bps || opp {
+                                    let gross_bps  = move_bps;
+                                    let net_bps    = gross_bps - 2.0 * tcfg.fee_bps;
+                                    let notional   = pos_size * entry_price * tcfg.leverage;
+                                    let fees_quote = notional * (2.0 * tcfg.fee_bps / 10_000.0);
+                                    let pnl_quote  = notional * (gross_bps / 10_000.0) - fees_quote;
+
+                                    let slot = order_book.round_trips.write_idx
+                                        .load(Ordering::Relaxed) as usize & RT_MASK;
+                                    let rt = &mut (*order_book.round_trips.entries.get())[slot];
+                                    rt.entry_time_ns = entry_time;
+                                    rt.exit_time_ns  = tick_now_ns;
+                                    rt.hold_ns       = tick_now_ns.saturating_sub(entry_time);
+                                    rt.side          = pos_side;
+                                    rt.entry_price   = entry_price;
+                                    rt.exit_price    = price;
+                                    rt.size          = pos_size;
+                                    rt.gross_bps     = gross_bps;
+                                    rt.net_bps       = net_bps;
+                                    rt.pnl_quote     = pnl_quote;
+                                    rt.fees_quote    = fees_quote;
+                                    rt._pad          = 0.0;
+                                    order_book.round_trips.write_idx.fetch_add(1, Ordering::Release);
+
+                                    order_book.net_position.fetch_add(-pos_side, Ordering::Relaxed);
+                                    emit_latency_order(buffer, order_book, order_ring,
+                                        current_seq, tick_now_ns, tick_ptr.transit_est_ns);
+                                    pos_side = 0;
                                 }
                             }
                         }

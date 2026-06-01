@@ -20,9 +20,15 @@ use std::thread;
 use std::time::Instant;
 use models::LatencyHistogram;
 
-pub(crate) const BUFFER_SIZE:     usize = 1024;
-pub(crate) const TRADE_LOG_SIZE:  usize = 1024;
-pub(crate) const ORDER_RING_SIZE: usize = 1024;
+pub(crate) const BUFFER_SIZE:        usize = 1024;
+pub(crate) const TRADE_LOG_SIZE:     usize = 1024;
+pub(crate) const ORDER_RING_SIZE:    usize = 1024;
+pub(crate) const ROUND_TRIP_LOG_SIZE: usize = 4096;
+
+/// Parse an env var as an f32, falling back to `default` when unset/invalid.
+fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(default)
+}
 
 fn main() {
     println!("[engine] starting — running full simulation in-process");
@@ -41,7 +47,26 @@ fn main() {
         .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
     // Downtick mode: buy on any price decrease. Fires on any feed that moves at all.
     let buy_on_downtick = std::env::var_os("HFT_DOWNTICK").is_some();
-    if buy_on_downtick {
+
+    // Trading model: long & short mean-reversion with TP/SL + opposite-signal exits,
+    // fees, leverage, and a P&L scorecard. Enabled by HFT_TRADE=1.
+    let trade_cfg = models::TradeCfg {
+        enabled:       std::env::var_os("HFT_TRADE").is_some(),
+        allow_short:   std::env::var_os("HFT_NO_SHORT").is_none(),
+        entry_dip_bps: env_f32("HFT_ENTRY_BPS", rust_hft_software::config::ENTRY_DIP_BPS_DEFAULT),
+        tp_bps:        env_f32("HFT_TP_BPS",     rust_hft_software::config::TP_BPS_DEFAULT),
+        sl_bps:        env_f32("HFT_SL_BPS",     rust_hft_software::config::SL_BPS_DEFAULT),
+        fee_bps:       env_f32("HFT_FEE_BPS",    rust_hft_software::config::FEE_BPS_DEFAULT),
+        leverage:      env_f32("HFT_LEVERAGE",   rust_hft_software::config::LEVERAGE_DEFAULT),
+        base_size:     env_f32("HFT_BASE_SIZE",  rust_hft_software::config::BASE_SIZE_DEFAULT),
+        max_size_mult: env_f32("HFT_MAX_SIZE_MULT", rust_hft_software::config::MAX_SIZE_MULT_DEFAULT),
+    };
+
+    if trade_cfg.enabled {
+        println!("[engine] TRADING model: {} mean-reversion  entry {:.1}bps  TP {:.1}bps  SL {:.1}bps  fee {:.1}bps/side  lev {:.0}x",
+            if trade_cfg.allow_short { "long&short" } else { "long-only" },
+            trade_cfg.entry_dip_bps, trade_cfg.tp_bps, trade_cfg.sl_bps, trade_cfg.fee_bps, trade_cfg.leverage);
+    } else if buy_on_downtick {
         println!("[engine] downtick mode: buy on any price decrease");
     } else if target_dip_bps > 0.0 {
         println!("[engine] dip mode: buy on a {target_dip_bps} bps dip below the rolling reference");
@@ -74,6 +99,8 @@ fn main() {
         target_price,
         target_dip_bps,
         buy_on_downtick,
+        trade_cfg,
+        round_trips:   models::RoundTripLog::new(),
     });
 
     let order_ring = Arc::new(models::OrderRing::new());
@@ -95,6 +122,10 @@ fn main() {
         let log = (*order_book.trade_log.entries.get()).as_ptr() as *mut u64;
         for i in (0..TRADE_LOG_SIZE * 8).step_by(8) {  // TradeExecution = 64 bytes / 8 × u64 (invariant #10)
             std::ptr::write_volatile(log.add(i), 0);
+        }
+        let rt = (*order_book.round_trips.entries.get()).as_ptr() as *mut u64;
+        for i in (0..ROUND_TRIP_LOG_SIZE * 8).step_by(8) {  // RoundTrip = 64 bytes / 8 × u64
+            std::ptr::write_volatile(rt.add(i), 0);
         }
     }
 

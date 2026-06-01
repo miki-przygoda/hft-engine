@@ -256,6 +256,29 @@ Each order's fill is the market price *one transit (RTT/2) later*, so the report
 
 > **Calibrating an absolute target:** it only fires when the price crosses *down through* your level, so set it just below the current market. The report always prints the **observed price range** — if you get 0 attempts, set `HFT_TARGET_PRICE` inside that range, or just use `HFT_TARGET_DIP_BPS` which fires at any level. See [`CLAUDE.md`](CLAUDE.md#execution-model-target-price--slippage).
 
+### Trading model & P&L scorecard
+
+`HFT_TRADE=1` turns the engine into a **long & short mean-reversion** model: it buys small dips / shorts small rips against a rolling reference, sizes up dynamically on bigger dislocations, and exits on **take-profit / stop-loss / opposite signal**. At shutdown it prints a P&L scorecard — round-trips, win rate, net P&L (bps & quote), profit factor, max drawdown, Sharpe, avg hold — **net of fees and scaled by leverage**:
+
+```bash
+HFT_TRADE=1 HFT_ENTRY_BPS=3 HFT_TP_BPS=10 HFT_SL_BPS=20 \
+  HFT_FEE_BPS=2.6 HFT_LEVERAGE=2 make live PAIR=XBT/USD
+
+# Offline, deterministic (mean-reverting sample → reliably profitable):
+HFT_TRADE=1 make replay
+```
+
+```
+TRADING SCORECARD  (long&short mean-reversion, 2x leverage, 2.6 bps/side fee)
+Round-trips: 224  (120 long / 104 short)  |  win rate 67.9%  (152W / 72L)
+Net P&L: +25135.30 quote   (gross +9.73 bps/trade, net +4.53 bps/trade after fees)
+Avg win +24.68 bps  |  avg loss -38.03 bps  |  profit factor 1.44
+Max drawdown 1385.78 quote  |  Sharpe(/trade) 0.15  |  avg hold 6.6 ms
+→ Model is net PROFITABLE after fees over this run.
+```
+
+Knobs (all env-overridable): `HFT_ENTRY_BPS`, `HFT_TP_BPS`, `HFT_SL_BPS`, `HFT_FEE_BPS` (per side), `HFT_LEVERAGE`, `HFT_BASE_SIZE`, `HFT_MAX_SIZE_MULT`, `HFT_NO_SHORT`. The JSON log gains a `trading` scorecard object, an `equity_curve`, and a `round_trip_log`. **Fees are the edge-killer** — a strategy that looks great gross often dies once `HFT_FEE_BPS` is realistic. See [`CLAUDE.md`](CLAUDE.md#trading-model-hft_trade).
+
 ---
 
 ## What isn't here

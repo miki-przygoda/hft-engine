@@ -12,7 +12,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::{BUFFER_SIZE, ORDER_RING_SIZE, TRADE_LOG_SIZE};
+use crate::{BUFFER_SIZE, ORDER_RING_SIZE, ROUND_TRIP_LOG_SIZE, TRADE_LOG_SIZE};
 use rust_hft_software::config::MAX_INSTRUMENTS;
 
 /// A single market data tick — exactly one 64-byte cache line.
@@ -154,6 +154,58 @@ impl LatencyHistogram {
     }
 }
 
+/// Trading-model configuration (set once by `main` from env vars; read-only after).
+/// Plain `Copy` data shared across threads. `enabled` gates the whole trade path.
+#[derive(Copy, Clone)]
+pub(crate) struct TradeCfg {
+    pub enabled:       bool,
+    pub allow_short:   bool,
+    pub entry_dip_bps: f32,   // long when price ≤ ref·(1-x); short when ≥ ref·(1+x)
+    pub tp_bps:        f32,   // take-profit (favourable move from entry)
+    pub sl_bps:        f32,   // stop-loss (adverse move from entry)
+    pub fee_bps:       f32,   // taker fee charged per side
+    pub leverage:      f32,
+    pub base_size:     f32,   // base position size in base-currency units
+    pub max_size_mult: f32,   // cap on dynamic size scaling
+}
+
+/// One completed round-trip (entry → exit), the unit of the P&L scorecard.
+/// 64 bytes (4×u64 + 8×f32). Single writer: the strategy thread, on each exit.
+#[derive(Copy, Clone)]
+pub(crate) struct RoundTrip {
+    pub entry_time_ns: u64,
+    pub exit_time_ns:  u64,
+    pub hold_ns:       u64,
+    pub side:          i64,   // +1 long, -1 short
+    pub entry_price:   f32,
+    pub exit_price:    f32,
+    pub size:          f32,
+    pub gross_bps:     f32,   // signed favourable move, before fees
+    pub net_bps:       f32,   // gross_bps - 2·fee_bps
+    pub pnl_quote:     f32,   // net P&L in quote currency, including leverage
+    pub fees_quote:    f32,   // total fees paid (both sides), quote currency
+    pub _pad:          f32,
+}
+
+/// Single-writer lock-free log of completed round-trips (same protocol as TradeLog).
+pub(crate) struct RoundTripLog {
+    pub(crate) entries:   UnsafeCell<[RoundTrip; ROUND_TRIP_LOG_SIZE]>,
+    pub(crate) write_idx: AtomicU64,
+}
+
+unsafe impl Sync for RoundTripLog {}
+
+impl RoundTripLog {
+    pub(crate) fn new() -> Self {
+        RoundTripLog {
+            entries:   UnsafeCell::new(unsafe { std::mem::zeroed() }),
+            write_idx: AtomicU64::new(0),
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<RoundTrip>() == 64);
+
 /// Shared run state: the trade log, both latency histograms, and the run's
 /// bookkeeping atomics (stall/gap counters, the dirty-feed flag, the risk
 /// `halt`/`net_position`, and memory snapshots). One instance is shared by all
@@ -188,6 +240,9 @@ pub(crate) struct OrderBook {
     // any feed that moves at all — the fallback for very flat/thin markets. Highest
     // priority among the buy triggers.
     pub(crate) buy_on_downtick: bool,
+    // ── Trading model (HFT_TRADE) ───────────────────────────────────────────
+    pub(crate) trade_cfg:   TradeCfg,        // set once by main
+    pub(crate) round_trips: RoundTripLog,    // completed round-trips; sole writer: strategy
 }
 
 // ── Multi-instrument scaffold (item 8) ──────────────────────────────────────

@@ -307,7 +307,10 @@ owns `rt_hist`; reads happen only at shutdown after all hot-path activity stops.
 Holds the `trade_log`, both histograms, and the run's bookkeeping atomics:
 `stall_count` (idle-spin gaps > 500 ns), `gap_count` (sequence gaps), `dirty`
 (set by ingestor on a gap, cleared by the strategy after N clean ticks), `halt`
-(permanent risk kill-switch), `net_position`, and memory-snapshot fields.
+(permanent risk kill-switch), `net_position`, memory-snapshot fields, the
+execution/slippage counters and observed price range, the `TradeCfg`, and the
+`RoundTripLog` (completed round-trips for the trading-model scorecard — a
+single-writer log of 64-byte `RoundTrip` records, same protocol as `TradeLog`).
 
 ### `OrderRing` & `OrderEntry` — SPSC order submission
 
@@ -524,6 +527,35 @@ drives the ingestor alone.
 
 ---
 
+## Trading model (`HFT_TRADE`)
+
+With `HFT_TRADE=1` the strategy runs a closed-loop **long & short mean-reversion**
+book instead of one-sided buy attempts, and scores its P&L.
+
+- **Entry:** long when `price ≤ ref·(1−entry_bps)`, short when `price ≥ ref·(1+entry_bps)`,
+  where `ref` is the EMA reference (`α = 1/64`). Position **size scales with the dip
+  depth** (`depth/entry_bps`, clamped to `max_size_mult`) — the "dynamic, maximise
+  output" lever. `HFT_NO_SHORT` makes it long-only.
+- **Exit:** take-profit (`+tp_bps`), stop-loss (`−sl_bps`), or the opposite signal,
+  whichever comes first. Fills at the observed price; latency slippage is reported
+  separately (it's ~sub-bp, dwarfed by the fee).
+- **Accounting:** each round-trip records `gross_bps`, `net_bps` (gross − 2·fee),
+  `pnl_quote` (notional·move − fees, ×leverage), and hold time into a single-writer
+  `RoundTripLog` (64-byte `RoundTrip`, like `TradeLog`). Entries and exits are also
+  emitted as orders so signal-latency and round-trip stages still populate.
+- **Scorecard** (console + JSON, computed from the round-trip array at shutdown):
+  round-trips, long/short split, win rate, net P&L (bps & quote), avg win/avg loss,
+  profit factor, max drawdown, Sharpe (per-trade), avg hold. JSON also gets an
+  `equity_curve` and the full `round_trip_log`.
+- **Config** (all env-overridable; defaults in `config`): `HFT_ENTRY_BPS`,
+  `HFT_TP_BPS`, `HFT_SL_BPS`, `HFT_FEE_BPS` (per side), `HFT_LEVERAGE`,
+  `HFT_BASE_SIZE`, `HFT_MAX_SIZE_MULT`, `HFT_NO_SHORT`.
+
+The mean-reverting synth capture is reliably profitable; on real data the fee
+(`HFT_FEE_BPS`) is what usually turns a positive gross edge negative.
+
+---
+
 ## Timing primitive
 
 `elapsed_ns(start: &Instant) -> u64` is the single source of time, calling
@@ -648,7 +680,8 @@ a quick test.
 10. **The pre-touch step sizes match the structs** (8 u64s per tick/order-entry,
     **8 u64s per `TradeExecution`** — it is now 64 bytes). Changing a struct's
     size means changing the pre-touch loop. Compile-time `assert!`s in `models.rs`
-    pin both `MarketTick` and `TradeExecution` to 64 bytes.
+    pin `MarketTick`, `TradeExecution`, and `RoundTrip` to 64 bytes (the
+    round-trip log is pre-touched with the same step-8 loop).
 11. **Do not replace `Instant::elapsed()` with `mach_absolute_time()` FFI.**
     Empirically ~42× slower and unit-fragile.
 12. **The v2 market-data packet is 32 bytes.** The first 16 bytes stay

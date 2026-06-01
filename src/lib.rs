@@ -70,4 +70,16 @@ pub mod config {
     // reference by this fraction. 10 bps = 0.10%. Loaded once at startup into
     // the SIMD scale constant; see trading_strategy in engine.rs.
     pub const SIGNAL_MOMENTUM_BPS: u64 = 10;
+
+    // ── Trading model (HFT_TRADE) defaults; each is env-overridable in main ──
+    // Long & short mean-reversion: enter on a dip/rip vs a rolling reference,
+    // exit on take-profit / stop-loss / opposite signal. All values in bps unless
+    // noted. These defaults are illustrative, not calibrated alpha.
+    pub const ENTRY_DIP_BPS_DEFAULT: f32 = 3.0;   // long ≤ ref·(1-x), short ≥ ref·(1+x)
+    pub const TP_BPS_DEFAULT:        f32 = 10.0;  // take-profit
+    pub const SL_BPS_DEFAULT:        f32 = 10.0;  // stop-loss
+    pub const FEE_BPS_DEFAULT:       f32 = 2.6;   // Kraken taker, per side
+    pub const LEVERAGE_DEFAULT:      f32 = 1.0;
+    pub const BASE_SIZE_DEFAULT:     f32 = 1.0;   // base-currency units per trade
+    pub const MAX_SIZE_MULT_DEFAULT: f32 = 4.0;   // cap on dynamic size scaling
 }
