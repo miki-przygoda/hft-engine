@@ -35,7 +35,13 @@ fn main() {
     // the slippage vs the target caused by the latency gap. Unset / 0 → breakout.
     let target_price: f32 = std::env::var("HFT_TARGET_PRICE")
         .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
-    if target_price > 0.0 {
+    // Relative-dip mode: buy on any dip of this many bps below a rolling reference.
+    // Adapts to any price level (no need to know the market price up front).
+    let target_dip_bps: f32 = std::env::var("HFT_TARGET_DIP_BPS")
+        .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
+    if target_dip_bps > 0.0 {
+        println!("[engine] dip mode: buy on a {target_dip_bps} bps dip below the rolling reference");
+    } else if target_price > 0.0 {
         println!("[engine] target-price mode: buy when price ≤ {target_price}");
     }
 
@@ -62,6 +68,7 @@ fn main() {
         price_lo_bits: AtomicU32::new(f32::INFINITY.to_bits()),
         price_hi_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
         target_price,
+        target_dip_bps,
     });
 
     let order_ring = Arc::new(models::OrderRing::new());

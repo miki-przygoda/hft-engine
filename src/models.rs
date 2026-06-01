@@ -180,6 +180,10 @@ pub(crate) struct OrderBook {
     pub(crate) price_hi_bits: AtomicU32,        // max observed price (f32 bits); sole writer: ingestor
     // Target-price buy level, set once by main from HFT_TARGET_PRICE. 0.0 = breakout mode.
     pub(crate) target_price:  f32,
+    // Relative-dip threshold in bps (HFT_TARGET_DIP_BPS). >0 = buy on a dip of this
+    // many bps below a rolling reference; adapts to any price level. Takes priority
+    // over target_price.
+    pub(crate) target_dip_bps: f32,
 }
 
 // ── Multi-instrument scaffold (item 8) ──────────────────────────────────────

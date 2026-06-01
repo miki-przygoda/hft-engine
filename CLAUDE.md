@@ -490,10 +490,16 @@ HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
 The point of the live feed is to measure not just *how fast* the engine reacts but
 *what that speed is worth* — how far the price moves against you in the latency gap.
 
-- **Target-price mode** (`HFT_TARGET_PRICE=<price>`): the strategy buys each time
-  the price dips down through the target (a re-arming downward cross), instead of
-  on the SIMD breakout. This is what makes real trades happen on live data — a bare
-  breakout rarely fires in a quiet window. Unset (or `0`) → breakout mode.
+- **Relative-dip mode** (`HFT_TARGET_DIP_BPS=<bps>`, takes priority): buy on a dip
+  of N bps below a rolling EMA reference. Adapts to any absolute price level, so it
+  fires on real data without knowing the market price up front (a re-arming
+  detector waits for recovery to the reference before firing again). This is the
+  most robust trigger for live data.
+- **Target-price mode** (`HFT_TARGET_PRICE=<price>`): buy each time the price dips
+  down through a fixed target (a re-arming downward cross). Only fires when the
+  price crosses the level *from above*, so the target must sit just below the
+  current market — otherwise 0 attempts (the report prints the observed price range
+  to calibrate against). Unset / `0`, and no dip set → breakout mode.
 - **Deferred fill:** when an order is sent we don't yet know the fill price — it's
   the market price one transit (RTT/2) later. Each attempt is pushed onto a small
   FIFO of pending fills; a later tick whose timestamp passes the due time

@@ -589,7 +589,10 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
     let lo = f32::from_bits(order_book.price_lo_bits.load(Ordering::Relaxed));
     let hi = f32::from_bits(order_book.price_hi_bits.load(Ordering::Relaxed));
     println!("{}", "─".repeat(72));
-    if order_book.target_price > 0.0 {
+    if order_book.target_dip_bps > 0.0 {
+        println!("Dip buys ({:.1} bps)  |  attempts: {}  filled: {}  pending: {}  (slippage vs the price we acted on)",
+                 order_book.target_dip_bps, attempts, filled, pending);
+    } else if order_book.target_price > 0.0 {
         println!("Target buy @ {:.4}  |  attempts: {}  filled: {}  pending: {}",
                  order_book.target_price, attempts, filled, pending);
     } else {
@@ -928,6 +931,16 @@ pub(crate) unsafe fn trading_strategy(
         let use_target   = target_price > 0.0;
         let mut was_below = false;
 
+        // Relative-dip mode (takes priority): buy on a dip of `dip_mult` below a
+        // rolling EMA reference. Adapts to any absolute price level. `armed`
+        // prevents repeated fires until the price recovers back to the reference.
+        let use_dip   = order_book.target_dip_bps > 0.0;
+        let dip_mult  = 1.0_f32 - order_book.target_dip_bps / 10_000.0;
+        const EMA_ALPHA: f32 = 1.0 / 64.0;
+        let mut ref_px:   f32  = 0.0;
+        let mut ref_init: bool = false;
+        let mut armed:    bool = true;
+
         // Pending simulated fills (FIFO ring). When we send an order we don't know
         // the fill price yet — it's the market price one transit later. Each entry
         // resolves when a later tick's timestamp passes its due time, at which
@@ -1122,7 +1135,18 @@ pub(crate) unsafe fn trading_strategy(
                     // mode), or the SIMD breakout (default). The breakout asm runs
                     // either way to keep the window warm; its result is just ignored
                     // in target mode.
-                    let trigger = if use_target {
+                    let trigger = if use_dip {
+                        if !ref_init { ref_px = price; ref_init = true; }
+                        let thresh = ref_px * dip_mult;
+                        let fire = armed && price <= thresh;
+                        if fire {
+                            armed = false;          // wait for recovery before firing again
+                        } else if price >= ref_px {
+                            armed = true;
+                        }
+                        ref_px += (price - ref_px) * EMA_ALPHA;
+                        fire
+                    } else if use_target {
                         let below = price <= target_price;
                         let fire  = below && !was_below;
                         was_below = below;

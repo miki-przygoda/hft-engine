@@ -236,14 +236,21 @@ On Linux, prefix the engine with `sudo` (or `SUDO=sudo make live`) for `SCHED_FI
 
 ### Target price & slippage
 
-Set a price and the engine buys at market each time the price dips through it, then measures how far the **fill drifts from your target because of the latency gap** — the real cost of being slow:
+The engine buys at market on a trigger, then measures how far the **fill drifts from the price you wanted because of the latency gap** — the real cost of being slow. Two ways to trigger:
 
 ```bash
-HFT_TARGET_PRICE=2500 make live PAIR=ETH/USD   # buy ETH each time it dips to 2500
-HFT_TARGET_PRICE=60000 make replay             # offline, against a capture
+# Relative-dip (recommended): buy on any N-bps dip below a rolling reference —
+# adapts to any price level, no need to know the market price up front.
+HFT_TARGET_DIP_BPS=5 make live PAIR=ETH/USD
+
+# Absolute target: buy when the price dips through a fixed level you set.
+# (Set it WITHIN the live market range, or it never triggers — see note below.)
+HFT_TARGET_PRICE=60000 make replay
 ```
 
-Each order's fill is the market price *one transit (RTT/2) later*, so the report gains an execution block — attempts / filled / pending and **slippage in basis points** (e.g. `mean +24 bps`, meaning the fill landed ~0.24% off target while the order was in flight). With no target set it runs the breakout signal and measures slippage vs the entry price. The shutdown report and JSON also break latency into **transit** and **end-to-end** stages. See [`CLAUDE.md`](CLAUDE.md#execution-model-target-price--slippage) for the design.
+Each order's fill is the market price *one transit (RTT/2) later*, so the report gains an execution block — attempts / filled / pending and **slippage in basis points** (e.g. `mean +35 bps`, meaning the fill landed ~0.35% off the price you acted on while the order was in flight). With nothing set it runs the breakout signal and measures slippage vs the entry price. The report and JSON also break latency into **transit** and **end-to-end** stages.
+
+> **Calibrating an absolute target:** it only fires when the price crosses *down through* your level, so set it just below the current market. The report always prints the **observed price range** — if you get 0 attempts, set `HFT_TARGET_PRICE` inside that range, or just use `HFT_TARGET_DIP_BPS` which fires at any level. See [`CLAUDE.md`](CLAUDE.md#execution-model-target-price--slippage).
 
 ---
 
