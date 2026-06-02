@@ -63,6 +63,9 @@ pub mod config {
     pub const KRAKEN_HOST:  &str = "ws.kraken.com";
     pub const KRAKEN_PAIR:  &str = "XBT/USD";
     pub const STUNNEL_ADDR: &str = "127.0.0.1:8443";
+    // Kraken REST (historical trades) via a second stunnel service → api.kraken.com:443.
+    pub const KRAKEN_API_HOST: &str = "api.kraken.com";
+    pub const API_STUNNEL_ADDR: &str = "127.0.0.1:8444";
 
     // RTT probe cadence: how often the adapter sends a WebSocket ping to refresh
     // its RTT/2 one-way transit estimate.

@@ -471,13 +471,17 @@ The headline contrast: the data spends *milliseconds* reaching us, while the
 engine reacts in *hundreds of nanoseconds* — the ns stages are a rounding error
 against transit.
 
-### Record / replay
+### Record / replay / history
 
 `--record FILE` captures the live feed (packets + inter-arrival timing);
 `--replay FILE` re-emits it deterministically with no network — the way to run
-and verify offline. `--synth FILE` fabricates a capture for testing. Set
-`HFT_EXTERNAL_FEED=1` when running `trading-engine` so the internal simulator is
-disabled and the external feed drives the ingestor alone.
+and verify offline. `--synth FILE` fabricates a capture (`HFT_SYNTH_TICKS` sets
+the length — use a large value for a long "day" session). `--history --hours N
+--out FILE` pulls **real historical trades** from Kraken's REST `Trades` endpoint
+(paginated via the `last` cursor, both `--pair` and `--ref-pair`, interleaved by
+time) through a second stunnel service → `api.kraken.com:443`; transit is 0 (no
+live RTT). Set `HFT_EXTERNAL_FEED=1` when running `trading-engine` so the internal
+simulator is disabled and the external feed drives the ingestor alone.
 
 ```bash
 # Offline (no network):

@@ -234,6 +234,15 @@ HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
 
 On Linux, prefix the engine with `sudo` (or `SUDO=sudo make live`) for `SCHED_FIFO` + affinity (`CAP_SYS_NICE`).
 
+**Historical data (longer sessions).** To backtest a real multi-hour "day" without waiting, pull historical trades from Kraken's REST API (needs a second stunnel service → `api.kraken.com:443`, see `docs/stunnel.conf`):
+
+```bash
+./target/release/kraken-feed --history --hours 24 --pair XBT/USD --ref-pair ETH/USD --out recordings/day.krkr
+./target/release/trading-engine --backtest recordings/day.krkr      # sweep the whole day
+```
+
+For offline testing, `HFT_SYNTH_TICKS=100000 kraken-feed --synth recordings/day.krkr` fabricates a long deterministic session. Over a long session the backtest verdict is statistically confident (hundreds of out-of-sample round-trips) rather than small-sample noise.
+
 ### Target price & slippage
 
 The engine buys at market on a trigger, then measures how far the **fill drifts from the price you wanted because of the latency gap** — the real cost of being slow. Two ways to trigger:

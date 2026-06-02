@@ -36,11 +36,11 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rust_hft_software::config::{
-    INGESTOR_ADDR, KRAKEN_HOST, KRAKEN_PAIR, KRAKEN_REF_PAIR, RECORD_PATH_DEFAULT,
-    RTT_PING_INTERVAL_MS, STUNNEL_ADDR,
+    API_STUNNEL_ADDR, INGESTOR_ADDR, KRAKEN_API_HOST, KRAKEN_HOST, KRAKEN_PAIR,
+    KRAKEN_REF_PAIR, RECORD_PATH_DEFAULT, RTT_PING_INTERVAL_MS, STUNNEL_ADDR,
 };
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -429,6 +429,104 @@ fn run_synth(path: &str) -> io::Result<()> {
     Ok(())
 }
 
+// ── Historical data collection (Kraken REST /0/public/Trades) ──────────────────
+// Pulls past trades over `hours` and writes a .krkr the backtester/replay can use.
+// TLS is terminated by a second stunnel service → api.kraken.com:443 (HTTP/1.0 +
+// Connection-close so the body is a clean read-to-EOF, no chunked decoding).
+
+/// One-shot HTTP/1.0 GET; returns the response body (headers stripped).
+fn http_get(endpoint: &str, path: &str, host: &str) -> io::Result<String> {
+    let mut s = TcpStream::connect(endpoint)?;
+    s.set_read_timeout(Some(Duration::from_secs(20)))?;
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: hft-engine\r\nAccept: */*\r\n\r\n");
+    s.write_all(req.as_bytes())?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    Ok(match text.find("\r\n\r\n") { Some(p) => text[p + 4..].to_string(), None => text })
+}
+
+/// Parse a Kraken `Trades` JSON body → (trades as (price, signed_vol, time_ns), `last` cursor).
+/// Trade entry shape: `["price","vol",time,"side","ordtype","misc",id]` (time is unquoted).
+fn parse_rest_trades(body: &str) -> (Vec<(f32, f32, u64)>, String) {
+    let mut out = Vec::new();
+    let last = body.find("\"last\":\"")
+        .map(|i| body[i + 8..].split('"').next().unwrap_or("").to_string())
+        .unwrap_or_default();
+    let bytes = body.as_bytes();
+    let mut i = match body.find("[[") { Some(p) => p + 1, None => return (out, last) };
+    let n = bytes.len();
+    while i < n {
+        while i < n && bytes[i] != b'[' { i += 1; }
+        if i >= n { break; }
+        let mut j = i + 1;
+        while j < n && bytes[j] != b']' { j += 1; }
+        if j >= n { break; }
+        let f: Vec<&str> = body[i + 1..j].split(',').collect();
+        if f.len() >= 4 {
+            let price = f[0].trim().trim_matches('"').parse::<f32>();
+            let vol   = f[1].trim().trim_matches('"').parse::<f32>();
+            let time  = f[2].trim().trim_matches('"').parse::<f64>();
+            if let (Ok(price), Ok(vol), Ok(time)) = (price, vol, time) {
+                let signed = if f[3].trim().trim_matches('"').starts_with('s') { -vol } else { vol };
+                out.push((price, signed, (time * 1e9) as u64));
+            }
+        }
+        i = j + 1;
+    }
+    (out, last)
+}
+
+fn run_history(api: &str, pair: &str, ref_pair: &str, hours: u64, out: &str) -> io::Result<()> {
+    let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    let since0 = now_ns.saturating_sub(hours * 3_600 * 1_000_000_000);
+    println!("[history] collecting ~{hours}h of {pair} (0) + {ref_pair} (1) via {api} → {out}");
+
+    let mut all: Vec<(u64, u8, f32, f32)> = Vec::new();  // (time_ns, id, price, signed_vol)
+    for (id, p) in [(0u8, pair), (1u8, ref_pair)] {
+        let pair_q = p.replace('/', "");                  // XBT/USD → XBTUSD
+        let (mut since, mut pages, mut total) = (since0, 0u32, 0usize);
+        loop {
+            let path = format!("/0/public/Trades?pair={pair_q}&since={since}");
+            let body = match http_get(api, &path, KRAKEN_API_HOST) {
+                Ok(b) => b,
+                Err(e) => { eprintln!("\n[history] {p} fetch error: {e}"); break; }
+            };
+            let (trades, last) = parse_rest_trades(&body);
+            if trades.is_empty() { break; }
+            for (price, vol, t) in &trades { all.push((*t, id, *price, *vol)); }
+            total += trades.len();
+            pages += 1;
+            print!("\r[history] {p}: {total} trades ({pages} pages)…");
+            let _ = std::io::stdout().flush();
+            let next: u64 = last.parse().unwrap_or(0);
+            if next <= since || next >= now_ns || pages >= 500 { break; }
+            since = next;
+        }
+        println!();
+    }
+    if all.is_empty() {
+        return Err(io::Error::other("history: no trades (check the stunnel → api.kraken.com service)"));
+    }
+    all.sort_by_key(|t| t.0);
+
+    let mut rec = Recorder::create(out)?;
+    let mut seq = [1u64; 2];
+    let mut prev_t = all[0].0;
+    for (t, id, price, vol) in &all {
+        let delta = t.saturating_sub(prev_t).min(1_000_000_000);  // cap idle gaps at 1s
+        prev_t = *t;
+        let s = seq[*id as usize];
+        let pkt = build_packet(*price, *vol, s, *t, 0, *id);       // transit 0 (no live RTT)
+        rec.file.write_all(&delta.to_le_bytes())?;
+        rec.file.write_all(&(pkt.len() as u16).to_le_bytes())?;
+        rec.file.write_all(&pkt)?;
+        seq[*id as usize] = s + 1;
+    }
+    println!("[history] wrote {} trades to {out}", all.len());
+    Ok(())
+}
+
 fn sleep_ns(ns: u64) {
     if ns == 0 { return; }
     // Sleep for the millisecond bulk, spin for the sub-ms remainder for fidelity.
@@ -536,6 +634,10 @@ fn main() {
     let mut record: Option<String> = None;
     let mut replay: Option<String> = None;
     let mut synth: Option<String> = None;
+    let mut history = false;
+    let mut hours: u64 = 24;
+    let mut out = RECORD_PATH_DEFAULT.to_string();
+    let mut api = API_STUNNEL_ADDR.to_string();
 
     let mut i = 1;
     while i < args.len() {
@@ -547,13 +649,19 @@ fn main() {
             "--record"   => { record = Some(args.get(i + 1).cloned().unwrap_or_else(|| RECORD_PATH_DEFAULT.to_string())); if record.as_deref().map(|s| !s.starts_with("--")).unwrap_or(false) { i += 1; } }
             "--replay"   => { replay = Some(args.get(i + 1).cloned().unwrap_or_else(|| RECORD_PATH_DEFAULT.to_string())); i += 1; }
             "--synth"    => { synth = Some(args.get(i + 1).filter(|v| !v.starts_with("--")).cloned().unwrap_or_else(|| RECORD_PATH_DEFAULT.to_string())); if synth.as_deref().map(|s| !s.starts_with("--")).unwrap_or(false) && args.get(i + 1).map(|v| !v.starts_with("--")).unwrap_or(false) { i += 1; } }
+            "--history"  => { history = true; }
+            "--hours"    => { if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) { hours = v; i += 1; } }
+            "--out"      => { if let Some(v) = args.get(i + 1) { out = v.clone(); i += 1; } }
+            "--api"      => { if let Some(v) = args.get(i + 1) { api = v.clone(); i += 1; } }
             "--help" | "-h" => { print_usage(); return; }
             other => { eprintln!("[kraken-feed] unknown argument: {other}"); print_usage(); std::process::exit(2); }
         }
         i += 1;
     }
 
-    let result = if let Some(path) = synth {
+    let result = if history {
+        run_history(&api, &pair, &ref_pair, hours, &out)
+    } else if let Some(path) = synth {
         run_synth(&path)
     } else if let Some(path) = replay {
         run_replay(&path, &ingestor)
@@ -572,12 +680,13 @@ fn print_usage() {
         "kraken-feed — live Kraken trade feed → engine UDP\n\
          \n\
          USAGE:\n\
-         \x20 kraken-feed [--live HOST:PORT] [--pair SYMBOL] [--ingestor ADDR] [--record FILE]\n\
+         \x20 kraken-feed [--live HOST:PORT] [--pair SYMBOL] [--ref-pair SYMBOL] [--ingestor ADDR] [--record FILE]\n\
          \x20 kraken-feed --replay FILE [--ingestor ADDR]\n\
-         \x20 kraken-feed --synth [FILE]\n\
+         \x20 kraken-feed --synth [FILE]            (HFT_SYNTH_TICKS sets length)\n\
+         \x20 kraken-feed --history [--hours N] [--pair SYMBOL] [--ref-pair SYMBOL] [--out FILE] [--api HOST:PORT]\n\
          \n\
-         Defaults: --live {STUNNEL_ADDR}  --pair {KRAKEN_PAIR}  --ingestor {INGESTOR_ADDR}\n\
-         Live mode needs a local stunnel terminating TLS to {KRAKEN_HOST}:443 (see docs/stunnel.conf)."
+         Defaults: --live {STUNNEL_ADDR}  --api {API_STUNNEL_ADDR}  --pair {KRAKEN_PAIR}  --ref-pair {KRAKEN_REF_PAIR}\n\
+         Live needs stunnel → {KRAKEN_HOST}:443; --history needs a stunnel service → {KRAKEN_API_HOST}:443 (see docs/stunnel.conf)."
     );
 }
 
@@ -650,5 +759,18 @@ mod tests {
     fn non_trade_message_ignored() {
         assert!(parse_trades(r#"{"event":"heartbeat"}"#).is_empty());
         assert!(parse_trades(r#"{"event":"systemStatus","status":"online"}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_rest_history() {
+        // Kraken REST /0/public/Trades shape (time is an unquoted number).
+        let body = r#"{"error":[],"result":{"XXBTZUSD":[["96000.1","0.5",1700000000.5,"b","l","",1],["95999.0","0.2",1700000001.0,"s","m","",2]],"last":"1700000001000000000"}}"#;
+        let (trades, last) = parse_rest_trades(body);
+        assert_eq!(trades.len(), 2);
+        assert!((trades[0].0 - 96000.1).abs() < 0.1);
+        assert!((trades[0].1 - 0.5).abs() < 1e-6);                 // buy → positive
+        assert_eq!(trades[0].2, 1_700_000_000_500_000_000);        // 1700000000.5 s → ns
+        assert!((trades[1].1 + 0.2).abs() < 1e-6);                 // sell → negative
+        assert_eq!(last, "1700000001000000000");
     }
 }
