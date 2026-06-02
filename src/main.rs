@@ -58,21 +58,24 @@ fn main() {
         sl_bps:        env_f32("HFT_SL_BPS",     rust_hft_software::config::SL_BPS_DEFAULT),
         fee_bps:       env_f32("HFT_FEE_BPS",    rust_hft_software::config::FEE_BPS_DEFAULT),
         leverage:      env_f32("HFT_LEVERAGE",   rust_hft_software::config::LEVERAGE_DEFAULT),
-        base_size:     env_f32("HFT_BASE_SIZE",  rust_hft_software::config::BASE_SIZE_DEFAULT),
         max_size_mult: env_f32("HFT_MAX_SIZE_MULT", rust_hft_software::config::MAX_SIZE_MULT_DEFAULT),
         adaptive:      std::env::var_os("HFT_ADAPTIVE").is_some(),
+        use_flow:      std::env::var_os("HFT_USE_FLOW").is_some(),
+        capital:       env_f32("HFT_CAPITAL",   rust_hft_software::config::CAPITAL_DEFAULT),
+        risk_frac:     env_f32("HFT_RISK_FRAC", rust_hft_software::config::RISK_FRAC_DEFAULT),
     };
 
     if trade_cfg.enabled {
-        if trade_cfg.adaptive {
-            println!("[engine] TRADING model: {} mean-reversion, ADAPTIVE (entry 1σ / TP 1.5σ / SL 2.5σ)  fee {:.1}bps/side  lev {:.0}x",
-                if trade_cfg.allow_short { "long&short" } else { "long-only" },
-                trade_cfg.fee_bps, trade_cfg.leverage);
-        } else {
-            println!("[engine] TRADING model: {} mean-reversion  entry {:.1}bps  TP {:.1}bps  SL {:.1}bps  fee {:.1}bps/side  lev {:.0}x",
-                if trade_cfg.allow_short { "long&short" } else { "long-only" },
-                trade_cfg.entry_dip_bps, trade_cfg.tp_bps, trade_cfg.sl_bps, trade_cfg.fee_bps, trade_cfg.leverage);
-        }
+        let rule = if trade_cfg.adaptive { "ADAPTIVE (1σ/1.5σ/2.5σ)".to_string() }
+            else { format!("entry {:.1} / TP {:.1} / SL {:.1} bps",
+                trade_cfg.entry_dip_bps, trade_cfg.tp_bps, trade_cfg.sl_bps) };
+        println!("[engine] TRADING model: {} mean-reversion, {}{}  fee {:.1}bps/side  {:.0}x lev",
+            if trade_cfg.allow_short { "long&short" } else { "long-only" },
+            rule, if trade_cfg.use_flow { " +order-flow" } else { "" },
+            trade_cfg.fee_bps, trade_cfg.leverage);
+        println!("[engine] capital {:.2}  risk/trade {:.0}%  → notional/trade ≈ {:.2} at {:.0}x",
+            trade_cfg.capital, trade_cfg.risk_frac * 100.0,
+            trade_cfg.capital * trade_cfg.risk_frac * trade_cfg.leverage, trade_cfg.leverage);
     } else if buy_on_downtick {
         println!("[engine] downtick mode: buy on any price decrease");
     } else if target_dip_bps > 0.0 {

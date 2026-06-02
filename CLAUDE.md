@@ -544,17 +544,28 @@ book instead of one-sided buy attempts, and scores its P&L.
 - **Exit:** take-profit (`+tp_bps`), stop-loss (`−sl_bps`), or the opposite signal,
   whichever comes first. Fills at the observed price; latency slippage is reported
   separately (it's ~sub-bp, dwarfed by the fee).
+- **Order flow** (`HFT_USE_FLOW=1`): entries must be confirmed by an order-flow EMA
+  (signed trade volume — buy +, sell − — carried in the tick's `volume` field). Long
+  dips are only taken into net buying, short rips into net selling. The Kraken
+  adapter signs volume from the trade `side`; the synth generates flow correlated
+  with the reversion so it's a *noisy* leading signal.
+- **Leverage & capital:** sizing is capital-based. `margin = risk_frac·equity`,
+  `notional = margin·leverage`, and equity **compounds**. A position is **liquidated**
+  when it moves ≥ `1/leverage` against you, capped at the posted margin
+  (isolated-margin — you can't lose more than that). `HFT_CAPITAL`, `HFT_RISK_FRAC`,
+  `HFT_LEVERAGE` are the inputs; the scorecard reports return on capital, max
+  drawdown %, liquidations, and a ruin flag.
 - **Accounting:** each round-trip records `gross_bps`, `net_bps` (gross − 2·fee),
-  `pnl_quote` (notional·move − fees, ×leverage), and hold time into a single-writer
-  `RoundTripLog` (64-byte `RoundTrip`, like `TradeLog`). Entries and exits are also
-  emitted as orders so signal-latency and round-trip stages still populate.
-- **Scorecard** (console + JSON, computed from the round-trip array at shutdown):
-  round-trips, long/short split, win rate, net P&L (bps & quote), avg win/avg loss,
-  profit factor, max drawdown, Sharpe (per-trade), avg hold. JSON also gets an
-  `equity_curve` and the full `round_trip_log`.
-- **Config** (all env-overridable; defaults in `config`): `HFT_ENTRY_BPS`,
-  `HFT_TP_BPS`, `HFT_SL_BPS`, `HFT_FEE_BPS` (per side), `HFT_LEVERAGE`,
-  `HFT_BASE_SIZE`, `HFT_MAX_SIZE_MULT`, `HFT_NO_SHORT`.
+  `pnl_quote` (notional·move − fees), a liquidation flag, and hold time into a
+  single-writer `RoundTripLog` (64-byte `RoundTrip`, like `TradeLog`). Entries and
+  exits are also emitted as orders so signal-latency and round-trip stages populate.
+- **Scorecard** (console + JSON, from the round-trip array at shutdown): round-trips,
+  long/short split, win rate, liquidations, capital → final equity & return %, net
+  P&L (bps & quote), avg win/loss, profit factor, max drawdown (quote & %), Sharpe
+  (per-trade), avg hold, ruin flag. JSON also gets an `equity_curve` and `round_trip_log`.
+- **Config** (env-overridable; defaults in `config`): `HFT_ENTRY_BPS`, `HFT_TP_BPS`,
+  `HFT_SL_BPS`, `HFT_FEE_BPS` (per side), `HFT_LEVERAGE`, `HFT_CAPITAL`,
+  `HFT_RISK_FRAC`, `HFT_MAX_SIZE_MULT`, `HFT_USE_FLOW`, `HFT_ADAPTIVE`, `HFT_NO_SHORT`.
 
 `kraken-feed --synth` writes a deterministic **mean-reverting random walk** (OU
 pull + microstructure noise, ~0.7 bps/tick) — a realistic testbed, not the clean

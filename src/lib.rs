@@ -80,6 +80,7 @@ pub mod config {
     pub const SL_BPS_DEFAULT:        f32 = 10.0;  // stop-loss
     pub const FEE_BPS_DEFAULT:       f32 = 2.6;   // Kraken taker, per side
     pub const LEVERAGE_DEFAULT:      f32 = 1.0;
-    pub const BASE_SIZE_DEFAULT:     f32 = 1.0;   // base-currency units per trade
     pub const MAX_SIZE_MULT_DEFAULT: f32 = 4.0;   // cap on dynamic size scaling
+    pub const CAPITAL_DEFAULT:       f32 = 10_000.0; // starting capital (quote)
+    pub const RISK_FRAC_DEFAULT:     f32 = 0.10;  // margin per trade as a fraction of equity
 }

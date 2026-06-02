@@ -189,10 +189,11 @@ fn parse_frame(buf: &[u8]) -> Option<(u8, Vec<u8>, usize)> {
 
 // ── Kraken v1 trade parsing ───────────────────────────────────────────────────
 
-/// Extract `(price, origin_ts_ns)` from a Kraken v1 trade message. The shape is
-/// `[channelID, [["price","vol","time","side","ordType","misc"], ...], "trade", "pair"]`.
-/// Non-trade frames (status/heartbeat objects) yield an empty vec.
-fn parse_trades(msg: &str) -> Vec<(f32, u64)> {
+/// Extract `(price, signed_volume, origin_ts_ns)` from a Kraken v1 trade message.
+/// The shape is `[channelID, [["price","vol","time","side","ordType","misc"], ...],
+/// "trade", "pair"]`. `signed_volume` is +vol for a buy (side "b") and −vol for a
+/// sell (side "s") — the order-flow input. Non-trade frames yield an empty vec.
+fn parse_trades(msg: &str) -> Vec<(f32, f32, u64)> {
     let mut out = Vec::new();
     if !msg.contains("\"trade\"") { return out; }
     let bytes = msg.as_bytes();
@@ -206,10 +207,12 @@ fn parse_trades(msg: &str) -> Vec<(f32, u64)> {
         while j < n && bytes[j] != b']' { j += 1; }    // entries hold no nested arrays
         if j >= n { break; }
         let toks = quoted_tokens(&msg[i + 1..j]);
-        if toks.len() >= 3
-            && let (Ok(price), Some(ts)) = (toks[0].parse::<f32>(), parse_kraken_ts(&toks[2]))
+        if toks.len() >= 4
+            && let (Ok(price), Ok(vol), Some(ts)) =
+                (toks[0].parse::<f32>(), toks[1].parse::<f32>(), parse_kraken_ts(&toks[2]))
         {
-            out.push((price, ts));
+            let signed = if toks[3].starts_with('s') { -vol } else { vol };
+            out.push((price, signed, ts));
         }
         i = j + 1;
     }
@@ -377,9 +380,13 @@ fn run_synth(path: &str) -> io::Result<()> {
         let shock = (u() + u() + u()) / 3.0 * 14.0; // ~approx-normal noise, ~2 bps of 60k
         price += reversion + shock;
 
+        // Signed order flow: net buying when price is below fair value (about to
+        // revert up), plus noise — so flow is a *noisy* leading signal, not magic.
+        let signed_vol = ((center - price) * 0.02 + 1.2 * u()) as f32;
+
         let transit = 33_000_000 + (seq.wrapping_mul(2_654_435) % 8_000_000);
         let origin = 1_700_000_000_000_000_000u64.wrapping_add(seq.wrapping_mul(5_000_000));
-        let pkt = build_packet(price as f32, 0.01, seq, origin, transit);
+        let pkt = build_packet(price as f32, signed_vol, seq, origin, transit);
         rec.file.write_all(&5_000_000u64.to_le_bytes())?; // 5 ms apart
         rec.file.write_all(&(pkt.len() as u16).to_le_bytes())?;
         rec.file.write_all(&pkt)?;
@@ -441,8 +448,8 @@ fn run_live(
             match opcode {
                 0x1 => {
                     let msg = String::from_utf8_lossy(&payload);
-                    for (price, origin_ts_ns) in parse_trades(&msg) {
-                        let pkt = build_packet(price, 0.0, seq, origin_ts_ns, transit_est);
+                    for (price, signed_vol, origin_ts_ns) in parse_trades(&msg) {
+                        let pkt = build_packet(price, signed_vol, seq, origin_ts_ns, transit_est);
                         udp.send_to(&pkt, ingestor)?;
                         if let Some(r) = recorder.as_mut() { r.write(&pkt)?; }
                         seq += 1;
@@ -589,8 +596,10 @@ mod tests {
         let trades = parse_trades(msg);
         assert_eq!(trades.len(), 2);
         assert!((trades[0].0 - 5541.2).abs() < 0.01);
-        assert_eq!(trades[0].1, 1_534_614_057_321_597_000);
+        assert!((trades[0].1 + 0.15850568).abs() < 1e-6);   // sell → negative signed volume
+        assert_eq!(trades[0].2, 1_534_614_057_321_597_000);
         assert!((trades[1].0 - 5541.3).abs() < 0.01);
+        assert!((trades[1].1 - 0.10000000).abs() < 1e-6);   // buy → positive
     }
 
     #[test]

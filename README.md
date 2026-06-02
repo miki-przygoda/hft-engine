@@ -285,7 +285,15 @@ Max drawdown 1385.78 quote  |  Sharpe(/trade) 0.15  |  avg hold 6.6 ms
 → Model is net PROFITABLE after fees over this run.
 ```
 
-Knobs (all env-overridable): `HFT_ENTRY_BPS`, `HFT_TP_BPS`, `HFT_SL_BPS`, `HFT_FEE_BPS` (per side), `HFT_LEVERAGE`, `HFT_BASE_SIZE`, `HFT_MAX_SIZE_MULT`, `HFT_NO_SHORT`. The JSON log gains a `trading` scorecard object, an `equity_curve`, and a `round_trip_log`. **Fees are the edge-killer** — a strategy that looks great gross often dies once `HFT_FEE_BPS` is realistic. See [`CLAUDE.md`](CLAUDE.md#trading-model-hft_trade).
+**Order flow & leverage.** `HFT_USE_FLOW=1` only takes entries that order flow confirms (buy dips into net buying, short rips into net selling), using signed trade volume (buy +, sell −) from the Kraken feed. Sizing is **capital-based with real leverage**: you set `HFT_CAPITAL` and `HFT_RISK_FRAC` (margin per trade as a fraction of equity), equity compounds across trades, and a position is **liquidated** if it moves ≥ `1/leverage` against you (isolated-margin: you can't lose more than the posted margin). At high leverage a negative net edge compounds into ruin fast — the scorecard reports return on capital, liquidations, max drawdown %, and a `RUINED` flag.
+
+```bash
+# 50x leverage on $10k — watch a sub-bp gross edge get amplified into a blow-up:
+HFT_TRADE=1 HFT_ADAPTIVE=1 HFT_USE_FLOW=1 HFT_LEVERAGE=50 \
+  HFT_CAPITAL=10000 HFT_RISK_FRAC=0.1 HFT_FEE_BPS=2.6 make replay
+```
+
+Knobs (all env-overridable): `HFT_ENTRY_BPS`, `HFT_TP_BPS`, `HFT_SL_BPS`, `HFT_FEE_BPS` (per side), `HFT_LEVERAGE`, `HFT_CAPITAL`, `HFT_RISK_FRAC`, `HFT_MAX_SIZE_MULT`, `HFT_USE_FLOW`, `HFT_ADAPTIVE`, `HFT_NO_SHORT`. The JSON log gains a `trading` scorecard (capital, final equity, return %, liquidations, ruined), an `equity_curve`, and a `round_trip_log`. **Fees + leverage are the killers** — a sub-bp gross edge that survives at 1× compounds into a blow-up at 50×. See [`CLAUDE.md`](CLAUDE.md#trading-model-hft_trade).
 
 ---
 

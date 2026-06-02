@@ -538,23 +538,26 @@ fn summarize_slippage(v: Vec<f64>) -> Option<SlipStat> {
 
 // P&L scorecard computed from the completed round-trips at shutdown.
 struct Scorecard {
-    n: usize, wins: usize, losses: usize, longs: usize, shorts: usize,
+    n: usize, wins: usize, losses: usize, longs: usize, shorts: usize, liquidations: usize,
+    gross_wins: usize, hit_rate: f64,
     win_rate: f64,
     total_pnl: f64, total_fees: f64,
     gross_bps_mean: f64, net_bps_mean: f64,
     avg_win_bps: f64, avg_loss_bps: f64,
-    profit_factor: f64, max_drawdown: f64, sharpe: f64, avg_hold_ms: f64,
+    profit_factor: f64, max_drawdown: f64, max_dd_pct: f64, sharpe: f64, avg_hold_ms: f64,
+    capital: f64, final_equity: f64, return_pct: f64, ruined: bool,
 }
 
-fn scorecard(rts: &[models::RoundTrip]) -> Option<Scorecard> {
+fn scorecard(rts: &[models::RoundTrip], capital: f64) -> Option<Scorecard> {
     if rts.is_empty() { return None; }
     let n = rts.len();
-    let (mut wins, mut losses, mut longs, mut shorts) = (0usize, 0usize, 0usize, 0usize);
+    let (mut wins, mut losses, mut longs, mut shorts, mut liquidations) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut gross_wins = 0usize;
     let (mut total_pnl, mut total_fees) = (0.0f64, 0.0f64);
     let (mut gross_sum, mut net_sum) = (0.0f64, 0.0f64);
     let (mut win_bps_sum, mut loss_bps_sum) = (0.0f64, 0.0f64);
     let (mut win_pnl, mut loss_pnl, mut hold_sum) = (0.0f64, 0.0f64, 0.0f64);
-    let (mut equity, mut peak, mut maxdd) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut equity, mut peak, mut maxdd, mut min_eq) = (capital, capital, 0.0f64, capital);
     let mut nets: Vec<f64> = Vec::with_capacity(n);
     for t in rts {
         let net = t.net_bps as f64;
@@ -562,17 +565,22 @@ fn scorecard(rts: &[models::RoundTrip]) -> Option<Scorecard> {
         total_pnl += t.pnl_quote as f64; total_fees += t.fees_quote as f64;
         hold_sum += t.hold_ns as f64;
         if t.side > 0 { longs += 1; } else { shorts += 1; }
+        if t.flags >= 0.5 { liquidations += 1; }
+        if t.gross_bps > 0.0 { gross_wins += 1; }   // signal accuracy (before fees)
         if net > 0.0 { wins += 1; win_bps_sum += net; win_pnl += t.pnl_quote as f64; }
         else { losses += 1; loss_bps_sum += net; loss_pnl += t.pnl_quote as f64; }
         nets.push(net);
         equity += t.pnl_quote as f64;
         if equity > peak { peak = equity; }
         if peak - equity > maxdd { maxdd = peak - equity; }
+        if equity < min_eq { min_eq = equity; }
     }
     let mean = net_sum / n as f64;
     let std = (nets.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64).sqrt();
+    let final_equity = (capital + total_pnl).max(0.0);
     Some(Scorecard {
-        n, wins, losses, longs, shorts,
+        n, wins, losses, longs, shorts, liquidations,
+        gross_wins, hit_rate: gross_wins as f64 / n as f64 * 100.0,
         win_rate: wins as f64 / n as f64 * 100.0,
         total_pnl, total_fees,
         gross_bps_mean: gross_sum / n as f64, net_bps_mean: mean,
@@ -581,8 +589,11 @@ fn scorecard(rts: &[models::RoundTrip]) -> Option<Scorecard> {
         profit_factor: if loss_pnl < 0.0 { win_pnl / -loss_pnl }
                        else if win_pnl > 0.0 { f64::INFINITY } else { 0.0 },
         max_drawdown: maxdd,
+        max_dd_pct: if peak > 0.0 { maxdd / peak * 100.0 } else { 0.0 },
         sharpe: if std > 0.0 { mean / std } else { 0.0 },
         avg_hold_ms: hold_sum / n as f64 / 1e6,
+        capital, final_equity, return_pct: (final_equity - capital) / capital * 100.0,
+        ruined: min_eq <= 0.0,
     })
 }
 
@@ -687,25 +698,31 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
         println!("{}", "─".repeat(72));
         let rule = if cfg.adaptive { "ADAPTIVE (entry 1σ/TP 1.5σ/SL 2.5σ)".to_string() }
                    else { format!("entry {:.1}/TP {:.1}/SL {:.1} bps", cfg.entry_dip_bps, cfg.tp_bps, cfg.sl_bps) };
-        println!("TRADING SCORECARD  ({} mean-reversion, {}, {:.0}x lev, {:.1} bps/side fee)",
-                 if cfg.allow_short { "long&short" } else { "long-only" }, rule, cfg.leverage, cfg.fee_bps);
+        println!("TRADING SCORECARD  ({} mean-reversion, {}{}, {:.0}x lev, {:.1} bps/side fee)",
+                 if cfg.allow_short { "long&short" } else { "long-only" }, rule,
+                 if cfg.use_flow { " +order-flow" } else { "" }, cfg.leverage, cfg.fee_bps);
         if lo.is_finite() && hi.is_finite() {
             let range_bps = if lo > 0.0 { (hi - lo) / lo * 10_000.0 } else { 0.0 };
             println!("Observed price range: [{:.2}, {:.2}]  ({:.1} bps span)  |  volatility ~{:.2} bps/tick",
                      lo, hi, range_bps, vol);
         }
-        match scorecard(rts) {
+        match scorecard(rts, cfg.capital as f64) {
             Some(s) => {
-                println!("Round-trips: {}  ({} long / {} short)  |  win rate {:.1}%  ({}W / {}L)",
-                         s.n, s.longs, s.shorts, s.win_rate, s.wins, s.losses);
+                println!("Round-trips: {}  ({} long / {} short)  |  liquidations {}",
+                         s.n, s.longs, s.shorts, s.liquidations);
+                println!("Hit rate (signal accuracy, gross): {:.1}% ({}/{})   |   net-win rate (after fees): {:.1}% ({}W/{}L)",
+                         s.hit_rate, s.gross_wins, s.n, s.win_rate, s.wins, s.losses);
+                println!("Capital {:.2} → equity {:.2}   ({:+.2}% return on capital{})",
+                         s.capital, s.final_equity, s.return_pct, if s.ruined { ", RUINED ☠" } else { "" });
                 println!("Net P&L: {:+.2} quote   (gross {:+.2} bps/trade, net {:+.2} bps/trade after fees)",
                          s.total_pnl, s.gross_bps_mean, s.net_bps_mean);
                 println!("Avg win {:+.2} bps  |  avg loss {:+.2} bps  |  profit factor {:.2}",
                          s.avg_win_bps, s.avg_loss_bps, s.profit_factor);
-                println!("Max drawdown {:.2} quote  |  Sharpe(/trade) {:.2}  |  fees paid {:.2}  |  avg hold {:.1} ms",
-                         s.max_drawdown, s.sharpe, s.total_fees, s.avg_hold_ms);
-                let verdict = if s.total_pnl > 0.0 { "net PROFITABLE" } else { "net LOSS" };
-                println!("→ Model is {verdict} after fees over this run.");
+                println!("Max drawdown {:.2} quote ({:.1}%)  |  Sharpe(/trade) {:.2}  |  fees {:.2}  |  avg hold {:.1} ms",
+                         s.max_drawdown, s.max_dd_pct, s.sharpe, s.total_fees, s.avg_hold_ms);
+                let verdict = if s.ruined { "BLOWN UP (account ruined)" }
+                              else if s.return_pct > 0.0 { "net PROFITABLE" } else { "net LOSS" };
+                println!("→ {verdict} after fees over this run.");
             }
             None => println!("No round-trips closed (try a busier pair, longer run, or smaller HFT_ENTRY_BPS)."),
         }
@@ -928,32 +945,38 @@ fn write_log(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
         let rts = &rts_all[..rt_count];
         let cfg = order_book.trade_cfg;
         json.push_str("  \"trading\": {\n");
-        json.push_str(&format!("    \"enabled\": true, \"allow_short\": {}, \"leverage\": {}, \"fee_bps\": {},\n",
-            cfg.allow_short, cfg.leverage, cfg.fee_bps));
+        json.push_str(&format!("    \"enabled\": true, \"allow_short\": {}, \"adaptive\": {}, \"use_flow\": {},\n",
+            cfg.allow_short, cfg.adaptive, cfg.use_flow));
+        json.push_str(&format!("    \"leverage\": {}, \"fee_bps\": {}, \"capital\": {}, \"risk_frac\": {},\n",
+            cfg.leverage, cfg.fee_bps, cfg.capital, cfg.risk_frac));
         json.push_str(&format!("    \"entry_dip_bps\": {}, \"tp_bps\": {}, \"sl_bps\": {},\n",
             cfg.entry_dip_bps, cfg.tp_bps, cfg.sl_bps));
-        match scorecard(rts) {
+        match scorecard(rts, cfg.capital as f64) {
             Some(s) => {
-                json.push_str(&format!("    \"round_trips\": {}, \"wins\": {}, \"losses\": {}, \"longs\": {}, \"shorts\": {},\n",
-                    s.n, s.wins, s.losses, s.longs, s.shorts));
-                json.push_str(&format!("    \"win_rate_pct\": {:.2}, \"net_pnl_quote\": {:.4}, \"total_fees_quote\": {:.4},\n",
-                    s.win_rate, s.total_pnl, s.total_fees));
+                json.push_str(&format!("    \"round_trips\": {}, \"longs\": {}, \"shorts\": {}, \"liquidations\": {},\n",
+                    s.n, s.longs, s.shorts, s.liquidations));
+                json.push_str(&format!("    \"gross_wins\": {}, \"hit_rate_pct\": {:.2}, \"net_wins\": {}, \"net_win_rate_pct\": {:.2},\n",
+                    s.gross_wins, s.hit_rate, s.wins, s.win_rate));
+                json.push_str(&format!("    \"capital\": {:.4}, \"final_equity\": {:.4}, \"return_pct\": {:.4}, \"ruined\": {},\n",
+                    s.capital, s.final_equity, s.return_pct, s.ruined));
+                json.push_str(&format!("    \"net_pnl_quote\": {:.4}, \"total_fees_quote\": {:.4},\n",
+                    s.total_pnl, s.total_fees));
                 json.push_str(&format!("    \"gross_bps_mean\": {:.4}, \"net_bps_mean\": {:.4}, \"avg_win_bps\": {:.4}, \"avg_loss_bps\": {:.4},\n",
                     s.gross_bps_mean, s.net_bps_mean, s.avg_win_bps, s.avg_loss_bps));
                 let pf = if s.profit_factor.is_finite() { format!("{:.4}", s.profit_factor) } else { "null".to_string() };
-                json.push_str(&format!("    \"profit_factor\": {}, \"max_drawdown_quote\": {:.4}, \"sharpe_per_trade\": {:.4}, \"avg_hold_ms\": {:.3}\n",
-                    pf, s.max_drawdown, s.sharpe, s.avg_hold_ms));
+                json.push_str(&format!("    \"profit_factor\": {}, \"max_drawdown_quote\": {:.4}, \"max_dd_pct\": {:.4}, \"sharpe_per_trade\": {:.4}, \"avg_hold_ms\": {:.3}\n",
+                    pf, s.max_drawdown, s.max_dd_pct, s.sharpe, s.avg_hold_ms));
             }
             None => json.push_str("    \"round_trips\": 0\n"),
         }
         json.push_str("  },\n");
 
-        // Equity curve (cumulative net P&L per round-trip) + the round-trip array.
+        // Equity curve (account equity after each round-trip) + the round-trip array.
         json.push_str("  \"equity_curve\": [");
-        let mut eq = 0.0f64;
+        let mut eq = cfg.capital as f64;
         for (i, t) in rts.iter().enumerate() {
             eq += t.pnl_quote as f64;
-            json.push_str(&format!("{}{:.4}", if i > 0 { ", " } else { "" }, eq));
+            json.push_str(&format!("{}{:.4}", if i > 0 { ", " } else { "" }, eq.max(0.0)));
         }
         json.push_str("],\n");
 
@@ -1155,6 +1178,13 @@ pub(crate) unsafe fn trading_strategy(
         let mut vol_ema:  f32 = 0.0;
         let mut vol_prev: f32 = 0.0;
         let mut vol_init: bool = false;
+        // Order-flow imbalance: EMA of signed trade volume (buy +, sell −).
+        const FLOW_ALPHA: f32 = 1.0 / 16.0;
+        let mut flow_ema: f32 = 0.0;
+        // Capital / equity (compounds across round-trips); drives position sizing.
+        let mut equity:    f64  = tcfg.capital as f64;
+        let mut entry_margin: f64 = 0.0;   // capital at risk on the open position
+        let mut ruined:    bool = false;
 
         // Pending simulated fills (FIFO ring). When we send an order we don't know
         // the fill price yet — it's the market price one transit later. Each entry
@@ -1440,14 +1470,15 @@ pub(crate) unsafe fn trading_strategy(
                     }
 
                     // ── Trading model: long & short mean-reversion ──────────────
-                    // Enter on a dip/rip vs a rolling EMA reference; exit on
-                    // take-profit, stop-loss, or the opposite signal. Fills at the
-                    // observed price; P&L is recorded per round-trip, net of fees and
-                    // scaled by leverage. (The latency slippage is reported separately.)
+                    // Enter on a dip/rip vs a rolling EMA reference (optionally
+                    // confirmed by order flow); exit on take-profit, stop-loss, the
+                    // opposite signal, or LIQUIDATION (adverse move ≥ 1/leverage).
+                    // Sizing is capital-based: margin = risk_frac·equity, notional =
+                    // margin·leverage, and equity compounds across round-trips.
                     if tcfg.enabled {
                         if !ref_init { ref_px = price; ref_init = true; }
 
-                        // Rolling volatility estimate (bps/tick).
+                        // Rolling volatility estimate (bps/tick) and order-flow EMA.
                         if vol_init {
                             let ret = ((price - vol_prev) / vol_prev * 10_000.0).abs();
                             vol_ema += (ret - vol_ema) * VOL_ALPHA;
@@ -1456,37 +1487,41 @@ pub(crate) unsafe fn trading_strategy(
                         }
                         vol_prev = price;
                         order_book.vol_ema_bits.store(vol_ema.to_bits(), Ordering::Relaxed);
+                        flow_ema += (tick_ptr.volume - flow_ema) * FLOW_ALPHA;  // signed volume
 
-                        // Effective thresholds: adaptive (σ multiples) or fixed bps.
                         let (entry_bps, tp_bps, sl_bps) = if tcfg.adaptive {
                             let s = vol_ema.max(VOL_FLOOR);
                             (s * 1.0, s * 1.5, s * 2.5)
                         } else {
                             (tcfg.entry_dip_bps, tcfg.tp_bps, tcfg.sl_bps)
                         };
+                        let liq_bps = 10_000.0 / tcfg.leverage.max(1.0);  // adverse move that wipes margin
 
                         let dip   = entry_bps / 10_000.0;
-                        let lo_th = ref_px * (1.0 - dip);
-                        let hi_th = ref_px * (1.0 + dip);
-                        let long_sig  = price <= lo_th;
-                        let short_sig = price >= hi_th;
+                        let long_sig  = price <= ref_px * (1.0 - dip);
+                        let short_sig = price >= ref_px * (1.0 + dip);
                         ref_px += (price - ref_px) * EMA_ALPHA;
 
-                        if current_seq > WARMUP_PACKETS {
+                        if current_seq > WARMUP_PACKETS && !ruined {
                             if pos_side == 0 {
-                                let dir: i64 = if long_sig { 1 }
-                                    else if short_sig && tcfg.allow_short { -1 }
-                                    else { 0 };
+                                // Order-flow confirmation: only buy dips into net buying,
+                                // short rips into net selling (when HFT_USE_FLOW is set).
+                                let long_ok  = long_sig  && (!tcfg.use_flow || flow_ema >= 0.0);
+                                let short_ok = short_sig && tcfg.allow_short
+                                                         && (!tcfg.use_flow || flow_ema <= 0.0);
+                                let dir: i64 = if long_ok { 1 } else if short_ok { -1 } else { 0 };
                                 if dir != 0 && !order_book.halt.load(Ordering::Relaxed) {
-                                    // Dynamic size: scale with the depth of the dislocation, capped.
                                     let depth_frac = if dir == 1 { (ref_px - price) / ref_px }
                                                      else { (price - ref_px) / ref_px };
-                                    let depth_bps = depth_frac * 10_000.0;
-                                    let mult = (depth_bps / entry_bps.max(VOL_FLOOR)).clamp(1.0, tcfg.max_size_mult);
-                                    pos_size    = tcfg.base_size * mult;
-                                    entry_price = price;
-                                    entry_time  = tick_now_ns;
-                                    pos_side    = dir;
+                                    let depth_mult = ((depth_frac * 10_000.0) / entry_bps.max(VOL_FLOOR))
+                                                     .clamp(1.0, tcfg.max_size_mult) as f64;
+                                    let risk     = (tcfg.risk_frac as f64 * depth_mult).min(1.0);
+                                    entry_margin = equity * risk;
+                                    let notional = entry_margin * tcfg.leverage as f64;
+                                    pos_size     = (notional / price as f64) as f32;  // units
+                                    entry_price  = price;
+                                    entry_time   = tick_now_ns;
+                                    pos_side     = dir;
                                     order_book.net_position.fetch_add(dir, Ordering::Relaxed);
                                     emit_latency_order(buffer, order_book, order_ring,
                                         current_seq, tick_now_ns, tick_ptr.transit_est_ns);
@@ -1494,13 +1529,23 @@ pub(crate) unsafe fn trading_strategy(
                             } else {
                                 let move_bps = (price - entry_price) / entry_price
                                     * 10_000.0 * pos_side as f32;
-                                let opp = if pos_side == 1 { short_sig } else { long_sig };
-                                if move_bps >= tp_bps || move_bps <= -sl_bps || opp {
-                                    let gross_bps  = move_bps;
-                                    let net_bps    = gross_bps - 2.0 * tcfg.fee_bps;
-                                    let notional   = pos_size * entry_price * tcfg.leverage;
-                                    let fees_quote = notional * (2.0 * tcfg.fee_bps / 10_000.0);
-                                    let pnl_quote  = notional * (gross_bps / 10_000.0) - fees_quote;
+                                let opp        = if pos_side == 1 { short_sig } else { long_sig };
+                                let liquidated = move_bps <= -liq_bps;
+                                if move_bps >= tp_bps || move_bps <= -sl_bps || opp || liquidated {
+                                    let gross_bps  = move_bps as f64;
+                                    let notional   = entry_margin * tcfg.leverage as f64;
+                                    let fees_quote = notional * (2.0 * tcfg.fee_bps as f64 / 10_000.0);
+                                    // Isolated margin: a loss can't exceed the posted margin.
+                                    let raw_pnl    = notional * (gross_bps / 10_000.0) - fees_quote;
+                                    let pnl_quote  = raw_pnl.max(-entry_margin);
+                                    let was_liq    = liquidated || raw_pnl <= -entry_margin;
+
+                                    equity += pnl_quote;
+                                    if equity <= 0.0 {
+                                        equity = 0.0;
+                                        ruined = true;
+                                        halt_trading(order_book, "account ruined (equity ≤ 0)");
+                                    }
 
                                     let slot = order_book.round_trips.write_idx
                                         .load(Ordering::Relaxed) as usize & RT_MASK;
@@ -1512,11 +1557,11 @@ pub(crate) unsafe fn trading_strategy(
                                     rt.entry_price   = entry_price;
                                     rt.exit_price    = price;
                                     rt.size          = pos_size;
-                                    rt.gross_bps     = gross_bps;
-                                    rt.net_bps       = net_bps;
-                                    rt.pnl_quote     = pnl_quote;
-                                    rt.fees_quote    = fees_quote;
-                                    rt._pad          = 0.0;
+                                    rt.gross_bps     = gross_bps as f32;
+                                    rt.net_bps       = (gross_bps - 2.0 * tcfg.fee_bps as f64) as f32;
+                                    rt.pnl_quote     = pnl_quote as f32;
+                                    rt.fees_quote    = fees_quote as f32;
+                                    rt.flags         = if was_liq { 1.0 } else { 0.0 };
                                     order_book.round_trips.write_idx.fetch_add(1, Ordering::Release);
 
                                     order_book.net_position.fetch_add(-pos_side, Ordering::Relaxed);

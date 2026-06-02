@@ -165,9 +165,11 @@ pub(crate) struct TradeCfg {
     pub sl_bps:        f32,   // stop-loss (adverse move from entry)
     pub fee_bps:       f32,   // taker fee charged per side
     pub leverage:      f32,
-    pub base_size:     f32,   // base position size in base-currency units
     pub max_size_mult: f32,   // cap on dynamic size scaling
     pub adaptive:      bool,  // entry/TP/SL as multiples of rolling volatility
+    pub use_flow:      bool,  // require order-flow (signed-volume) confirmation
+    pub capital:       f32,   // starting capital (quote); equity compounds from here
+    pub risk_frac:     f32,   // fraction of equity used as margin per trade
 }
 
 /// One completed round-trip (entry → exit), the unit of the P&L scorecard.
@@ -185,7 +187,7 @@ pub(crate) struct RoundTrip {
     pub net_bps:       f32,   // gross_bps - 2·fee_bps
     pub pnl_quote:     f32,   // net P&L in quote currency, including leverage
     pub fees_quote:    f32,   // total fees paid (both sides), quote currency
-    pub _pad:          f32,
+    pub flags:         f32,   // 1.0 = closed by liquidation, else 0.0
 }
 
 /// Single-writer lock-free log of completed round-trips (same protocol as TradeLog).
