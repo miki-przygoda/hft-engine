@@ -83,6 +83,7 @@ src/
 ├── main.rs                          # Thread orchestration, buffer pre-touch, startup
 ├── engine.rs                        # Runtime: ingestor, exchange, watchdog, simulator, strategy, logging
 ├── models.rs                        # Data structures: MarketTick, RingBuffer, TradeLog, LatencyHistogram, OrderBook, OrderRing
+├── model.rs                         # AlphaModel: trend/cross-market signal + execution (shared by live & --backtest)
 ├── lib.rs                           # Shared config constants (rust_hft_software::config)
 ├── bin/
 │   ├── market-simulator.rs          # Standalone UDP packet sender (warmup + real packets)
@@ -609,6 +610,44 @@ terms have genuine predictive value offline. The mean-reversion default (`HFT_TR
 without `HFT_MOMENTUM`) still trades a single-market OU walk; flipping `HFT_MOMENTUM`
 on the same capture is the honest A/B (momentum ~58% hit / ~break-even vs
 mean-reversion ~30% hit / deep loss on a trend).
+
+---
+
+## Backtest harness + cost-aware execution
+
+The trade model lost because fees structurally exceed the edge, and we'd only ever
+tested in-sample. Two pieces address that:
+
+### `AlphaModel` — single source of truth (`src/model.rs`)
+The HFT_MOMENTUM signal + execution is factored into `AlphaModel`
+(`on_reference_tick` / `on_traded_tick` → `Decision`). The live `trading_strategy`
+calls it and applies side effects (latency order, round-trip log, `net_position`,
+signal logging); the backtester calls the **identical** model. The previous inline
+logic moved verbatim — a seeded replay produces the same scorecard before/after.
+
+### Backtest / sweep — `trading-engine --backtest <capture.krkr>`
+Offline (no threads/UDP/sleeps): loads a capture, runs `AlphaModel` over it
+**continuously** (warm EMAs, no future leakage), and **walk-forward** buckets the
+round-trips into in-sample (first 70% by time) and out-of-sample (last 30%). It
+sweeps a small grid (maker on/off × signal-threshold × trailing × fee-gate) and
+prints the configs **ranked by OOS return** with an overfit flag. `make sweep`.
+
+### Cost-aware knobs (all default to the prior behavior when off)
+- `HFT_MAKER` + `HFT_MAKER_BPS`: model a **passive (maker) entry** — you post a
+  limit at the dip/pullback and pay the maker fee (often a negative rebate) while
+  the exit crosses (taker = `HFT_FEE_BPS`). Round-trip cost = maker + taker.
+  *(Models the fee, not queue/fill realism — fill-when-crossed is a follow-up.)*
+- `HFT_FEE_GATE` + `HFT_MIN_EDGE_BPS`: only enter when the **expected move
+  (~`max(tp, 3σ)`) clears the round-trip cost** + buffer — kills doomed trades.
+- `HFT_NORMALIZE`: **z-score** the composite-signal terms (each / its rolling
+  |value|, re-expressed in σ units) so `w_flow`/`w_basket`/`w_leadlag` actually
+  matter instead of being swamped by raw `trend_bps`.
+
+On the realistic AR(1)-trend synth the sweep is honest: taker fees lose
+(best OOS ≈ −0.4%), a maker rebate helps (≈ −0.3%), zero-fee barely breaks even
+(weak gross edge) — and **z-scoring the signal is the lever that flips the best
+config OOS-positive**, a bigger effect than the fee. The harness's real use is
+pointing it at the user's recorded *live* captures.
 
 ---
 

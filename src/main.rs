@@ -10,6 +10,7 @@
 //! startup sequence depends on.
 
 mod engine;
+mod model;
 mod models;
 #[cfg(feature = "testing")]
 mod testing_scripts;
@@ -74,6 +75,11 @@ fn main() {
         trail_bps:      env_f32("HFT_TRAIL_BPS",      rust_hft_software::config::TRAIL_BPS_DEFAULT),
         signal_exit_bps: env_f32("HFT_SIGNAL_EXIT_BPS", rust_hft_software::config::SIGNAL_EXIT_BPS_DEFAULT),
         beta:           env_f32("HFT_BETA",      rust_hft_software::config::BETA_DEFAULT),
+        maker:          std::env::var_os("HFT_MAKER").is_some(),
+        maker_bps:      env_f32("HFT_MAKER_BPS",  rust_hft_software::config::MAKER_BPS_DEFAULT),
+        fee_gate:       std::env::var_os("HFT_FEE_GATE").is_some(),
+        min_edge_bps:   env_f32("HFT_MIN_EDGE_BPS", rust_hft_software::config::MIN_EDGE_BPS_DEFAULT),
+        normalize:      std::env::var_os("HFT_NORMALIZE").is_some(),
     };
 
     if trade_cfg.enabled && trade_cfg.momentum {
@@ -100,6 +106,15 @@ fn main() {
         println!("[engine] dip mode: buy on a {target_dip_bps} bps dip below the rolling reference");
     } else if target_price > 0.0 {
         println!("[engine] target-price mode: buy when price ≤ {target_price}");
+    }
+
+    // Backtest / parameter-sweep mode: run the model over a recorded capture
+    // offline (in-sample/out-of-sample split) and exit — no threads or sockets.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--backtest") {
+        let path = args.get(i + 1).cloned().unwrap_or_else(|| "recordings/two.krkr".to_string());
+        engine::run_backtest(&path, trade_cfg);
+        return;
     }
 
     // Two ring buffers sharing one clock origin: slot 0 = the traded instrument

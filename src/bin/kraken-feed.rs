@@ -371,7 +371,7 @@ fn run_replay(path: &str, ingestor: &str) -> io::Result<()> {
 /// reproducible. Override the seed with HFT_SYNTH_SEED for a different path.
 fn run_synth(path: &str) -> io::Result<()> {
     let mut rec = Recorder::create(path)?;
-    let n = 2000u64;
+    let n = 3000u64;
 
     let mut seed: u64 = std::env::var("HFT_SYNTH_SEED").ok()
         .and_then(|s| s.trim().parse().ok()).unwrap_or(0x5DEECE66D);
@@ -397,7 +397,10 @@ fn run_synth(path: &str) -> io::Result<()> {
     let mut ref_prev = ref_base;
 
     for seq in 1..=n {
-        trend = (trend + 0.03 * u()).clamp(-2.5, 2.5);
+        // Persistent trend drift (AR(1), half-life ~70 ticks): directional regimes
+        // come and go and persist long enough to ride — realistic trend + chop,
+        // spread across the whole capture so both IS and OOS contain trends.
+        trend = trend * 0.99 + 0.2 * u();
         f += trend + 5.0 * u();
         for k in (1..=LAG).rev() { f_hist[k] = f_hist[k - 1]; }
         f_hist[0] = f;

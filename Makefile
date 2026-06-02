@@ -6,7 +6,7 @@ PAIR   ?= XBT/USD
 DUR    ?= 30
 SAMPLE ?= recordings/sample.krkr
 
-.PHONY: help build test bench run synth replay live clean
+.PHONY: help build test bench run synth replay live sweep clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -34,6 +34,13 @@ replay: ## Offline: replay a capture through the engine (no network). FILE=path 
 
 live: ## Live: stream real Kraken trades for DUR=$(DUR)s (needs stunnel). PAIR=$(PAIR)
 	@scripts/live.sh $(DUR) $(PAIR)
+
+sweep: build ## Backtest sweep over a capture (in-sample/out-of-sample). FILE=path uses an existing capture
+	@mkdir -p recordings
+ifndef FILE
+	./target/release/kraken-feed --synth $(SAMPLE)
+endif
+	./target/release/trading-engine --backtest $(if $(FILE),$(FILE),$(SAMPLE))
 
 clean: ## Remove build artifacts
 	cargo clean

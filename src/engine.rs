@@ -604,6 +604,118 @@ fn scorecard(rts: &[models::RoundTrip], capital: f64) -> Option<Scorecard> {
     })
 }
 
+// ── Backtest / parameter sweep (offline; no threads, UDP, or sleeps) ─────────
+// Runs the SAME `AlphaModel` the live engine uses over a recorded capture, with an
+// in-sample/out-of-sample split and a small parameter grid, ranked by OOS return.
+
+struct BtTick { id: u8, price: f32, vol: f32, t_ns: u64 }
+
+fn load_capture(path: &str) -> std::io::Result<Vec<BtTick>> {
+    let data = std::fs::read(path)?;
+    if data.len() < 5 || &data[0..4] != b"KRKR" {
+        return Err(std::io::Error::other("backtest: bad capture magic"));
+    }
+    let mut out = Vec::new();
+    let (mut i, mut t) = (5usize, 0u64);
+    while i + 10 <= data.len() {
+        let delta = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+        let len = u16::from_le_bytes([data[i + 8], data[i + 9]]) as usize;
+        i += 10;
+        if i + len > data.len() || len < 8 { break; }
+        let pkt = &data[i..i + len];
+        i += len;
+        t = t.wrapping_add(delta);
+        out.push(BtTick {
+            id:    if len >= 33 { pkt[32] } else { 0 },
+            price: f32::from_le_bytes(pkt[0..4].try_into().unwrap()),
+            vol:   f32::from_le_bytes(pkt[4..8].try_into().unwrap()),
+            t_ns:  t,
+        });
+    }
+    Ok(out)
+}
+
+// Run the model over a tick stream (id 1 = reference, 0 = traded) → round-trips.
+fn run_model(ticks: &[BtTick], cfg: models::TradeCfg) -> Vec<models::RoundTrip> {
+    let mut model = crate::model::AlphaModel::new(cfg);
+    let mut rts = Vec::new();
+    let mut seq: u64 = 0;
+    for tk in ticks {
+        if tk.id == 1 { model.on_reference_tick(tk.price); continue; }
+        seq += 1;
+        let warmed = seq > WARMUP_PACKETS;
+        if let crate::model::Decision::Exit(rt) =
+            model.on_traded_tick(tk.price, tk.vol, tk.t_ns, warmed, false)
+        {
+            rts.push(rt);
+        }
+    }
+    rts
+}
+
+pub(crate) fn run_backtest(path: &str, base: models::TradeCfg) {
+    let ticks = match load_capture(path) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("[backtest] {e}"); return; }
+    };
+    let traded_n = ticks.iter().filter(|t| t.id == 0).count();
+    println!("[backtest] {} ticks ({} traded) from {}", ticks.len(), traded_n, path);
+    // Walk-forward split by TIME: the model runs continuously (warm EMAs, no future
+    // leakage); round-trips are bucketed in-sample / out-of-sample by entry time.
+    let split = ticks.len() * 70 / 100;
+    let t_split = ticks.get(split).map(|t| t.t_ns).unwrap_or(u64::MAX);
+    println!("  walk-forward split at {:.0}% of the capture  |  capital {:.0}, fee {:.1} bps/side, {:.0}x lev{}",
+        70.0, base.capital, base.fee_bps, base.leverage,
+        if base.normalize { ", normalized signal" } else { "" });
+
+    let mut base = base;
+    base.enabled = true;
+    base.momentum = true;
+
+    println!("{}", "─".repeat(86));
+    println!("{:<6} {:<5} {:<6} {:<5} | {:>9} {:>9} {:>8} {:>6} | flag", "maker", "thr", "trail", "gate",
+             "IS ret%", "OOS ret%", "OOS hit", "OOS n");
+    println!("{}", "─".repeat(86));
+
+    let mut rows: Vec<(f64, String)> = Vec::new();
+    for &maker in &[false, true] {
+        for &thr in &[3.0f32, 5.0, 10.0] {
+            for &trail in &[6.0f32, 10.0] {
+                for &gate in &[false, true] {
+                    let mut cfg = base;
+                    cfg.maker = maker;
+                    cfg.signal_thr_bps = thr;
+                    cfg.trail_bps = trail;
+                    cfg.fee_gate = gate;
+                    cfg.min_edge_bps = if gate { 2.0 } else { 0.0 };
+                    // One continuous run; bucket round-trips by entry time.
+                    let full = run_model(&ticks, cfg);
+                    let is_rts:  Vec<models::RoundTrip> = full.iter().copied().filter(|r| r.entry_time_ns <  t_split).collect();
+                    let oos_rts: Vec<models::RoundTrip> = full.iter().copied().filter(|r| r.entry_time_ns >= t_split).collect();
+                    let is_sc  = scorecard(&is_rts, cfg.capital as f64);
+                    let oos_sc = scorecard(&oos_rts, cfg.capital as f64);
+                    let isr  = is_sc.as_ref().map(|s| s.return_pct).unwrap_or(0.0);
+                    let oosr = oos_sc.as_ref().map(|s| s.return_pct).unwrap_or(0.0);
+                    let oh   = oos_sc.as_ref().map(|s| s.hit_rate).unwrap_or(0.0);
+                    let on   = oos_sc.as_ref().map(|s| s.n).unwrap_or(0);
+                    let flag = if isr > 0.0 && oosr < 0.0 { "overfit" }
+                               else if oosr > 0.0 { "OOS+" } else { "" };
+                    rows.push((oosr, format!(
+                        "{:<6} {:<5.0} {:<6.0} {:<5} | {:>8.2}% {:>8.2}% {:>7.1}% {:>6} | {}",
+                        maker, thr, trail, gate, isr, oosr, oh, on, flag)));
+                }
+            }
+        }
+    }
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    for (_, r) in &rows { println!("{r}"); }
+    println!("{}", "─".repeat(86));
+    if let Some((oosr, _)) = rows.first() {
+        println!("Best out-of-sample return: {:+.2}%  ({} configs; ranked by OOS, not in-sample)", oosr, rows.len());
+    }
+    println!("(maker fee = HFT_MAKER_BPS={:.1}; set HFT_NORMALIZE=1 to sweep the z-scored signal)", base.maker_bps);
+}
+
 fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
     let count  = (order_book.trade_log.write_idx.load(Ordering::Acquire) as usize).min(TRADE_LOG_SIZE);
     let trades = unsafe { &*order_book.trade_log.entries.get() };
@@ -1217,19 +1329,12 @@ pub(crate) unsafe fn trading_strategy(
         let mut entry_margin: f64 = 0.0;   // capital at risk on the open position
         let mut ruined:    bool = false;
 
-        // ── Trend-following + cross-market signal state (HFT_MOMENTUM) ───────
-        // Per-instrument fast/slow EMAs for a trend measure: [0]=traded, [1]=reference.
-        const FAST_ALPHA: f32 = 1.0 / 16.0;
-        const SLOW_ALPHA: f32 = 1.0 / 128.0;
-        let mut fast_ema: [f32; 2] = [0.0, 0.0];
-        let mut slow_ema: [f32; 2] = [0.0, 0.0];
-        let mut ema_init: [bool; 2] = [false, false];
-        let mut ref_prev_px: f32 = 0.0;          // reference last price (for its return)
-        let mut ref_ret_ema: f32 = 0.0;          // EMA of reference per-tick return (bps)
+        // ── Trend-following model (HFT_MOMENTUM) ─────────────────────────────
+        // The signal + execution live in AlphaModel (shared verbatim with the
+        // --backtest sweep); the strategy just feeds it ticks and applies the
+        // resulting side effects (latency order, round-trip log, net position).
+        let mut model = crate::model::AlphaModel::new(tcfg);
         let mut ref_last_seq: u64 = 0;           // last reference cursor we sampled
-        let mut flow_norm:   f32 = 1.0;          // rolling |flow| scale, normalizes flow term
-        let mut best_price:  f32 = 0.0;          // trailing-stop high/low water mark
-        // Downsampled signal series + per-trade signal at entry.
         const SIG_SERIES_MASK: usize = SIGNAL_SERIES_LEN - 1;
         let mut sig_tick: u64 = 0;
 
@@ -1523,125 +1628,47 @@ pub(crate) unsafe fn trading_strategy(
                     // WITH the trend but time entries on a pullback vs the fast EMA;
                     // exit on signal-flip or a trailing stop (TP/SL/liq as caps).
                     if tcfg.enabled && tcfg.momentum {
-                        // Sample the reference market (read-only across its cursor).
+                        // Feed the reference market when its cursor advances (before the
+                        // traded tick, matching the model's expected ordering).
                         let ref_seq = reference.latest_idx.load(Ordering::Acquire);
                         if ref_seq > 0 && ref_seq != ref_last_seq {
                             ref_last_seq = ref_seq;
-                            let rpx = reference.ticks[(ref_seq & BUFFER_MASK) as usize].price;
-                            if ema_init[1] {
-                                fast_ema[1] += (rpx - fast_ema[1]) * FAST_ALPHA;
-                                slow_ema[1] += (rpx - slow_ema[1]) * SLOW_ALPHA;
-                                let rret = if ref_prev_px > 0.0 {
-                                    (rpx - ref_prev_px) / ref_prev_px * 10_000.0 } else { 0.0 };
-                                ref_ret_ema += (rret - ref_ret_ema) * FAST_ALPHA;
-                            } else {
-                                fast_ema[1] = rpx; slow_ema[1] = rpx; ema_init[1] = true;
-                            }
-                            ref_prev_px = rpx;
+                            model.on_reference_tick(reference.ticks[(ref_seq & BUFFER_MASK) as usize].price);
                         }
-                        // Traded-instrument EMAs, order flow, volatility.
-                        if ema_init[0] {
-                            fast_ema[0] += (price - fast_ema[0]) * FAST_ALPHA;
-                            slow_ema[0] += (price - slow_ema[0]) * SLOW_ALPHA;
-                        } else { fast_ema[0] = price; slow_ema[0] = price; ema_init[0] = true; }
-                        flow_ema  += (tick_ptr.volume - flow_ema) * FLOW_ALPHA;
-                        flow_norm += (tick_ptr.volume.abs() - flow_norm) * SLOW_ALPHA;
-                        if vol_init {
-                            let ret = ((price - vol_prev) / vol_prev * 10_000.0).abs();
-                            vol_ema += (ret - vol_ema) * VOL_ALPHA;
-                        } else { vol_init = true; }
-                        vol_prev = price;
-                        order_book.vol_ema_bits.store(vol_ema.to_bits(), Ordering::Relaxed);
+                        let warmed = current_seq > WARMUP_PACKETS;
+                        let halted = order_book.halt.load(Ordering::Relaxed);
+                        let decision = model.on_traded_tick(price, tick_ptr.volume, tick_now_ns, warmed, halted);
 
-                        // Composite signal S (bps-comparable).
-                        let trend0 = if slow_ema[0] > 0.0 { (fast_ema[0]-slow_ema[0])/slow_ema[0]*10_000.0 } else { 0.0 };
-                        let trend1 = if slow_ema[1] > 0.0 { (fast_ema[1]-slow_ema[1])/slow_ema[1]*10_000.0 } else { 0.0 };
-                        let flow_term = (flow_ema / flow_norm.max(1e-6)).clamp(-3.0, 3.0) * 3.0;
-                        let leadlag   = ref_ret_ema * tcfg.beta;
-                        let s_sig = tcfg.w_trend * trend0 + tcfg.w_flow * flow_term
-                                  + tcfg.w_basket * trend1 + tcfg.w_leadlag * leadlag;
-                        order_book.latest_signal_bits.store(s_sig.to_bits(), Ordering::Relaxed);
+                        // Expose the signal: latest value, downsampled series, vol.
+                        order_book.latest_signal_bits.store(model.latest_signal_bps().to_bits(), Ordering::Relaxed);
+                        order_book.vol_ema_bits.store(model.vol_ema().to_bits(), Ordering::Relaxed);
                         sig_tick += 1;
                         if sig_tick & 7 == 0 {
                             let si = (order_book.signal.series_idx.load(Ordering::Relaxed) as usize) & SIG_SERIES_MASK;
-                            (*order_book.signal.series.get())[si] = s_sig;
+                            (*order_book.signal.series.get())[si] = model.latest_signal_bps();
                             order_book.signal.series_idx.fetch_add(1, Ordering::Relaxed);
                         }
 
-                        if current_seq > WARMUP_PACKETS && !ruined {
-                            let bullish = s_sig >  tcfg.signal_thr_bps;
-                            let bearish = s_sig < -tcfg.signal_thr_bps;
-                            let pb = tcfg.pullback_bps / 10_000.0;
-                            if pos_side == 0 {
-                                // Trend + pullback timing: buy a dip in an uptrend, short a rip in a downtrend.
-                                let long_ok  = bullish && price <= fast_ema[0] * (1.0 - pb);
-                                let short_ok = bearish && tcfg.allow_short && price >= fast_ema[0] * (1.0 + pb);
-                                let dir: i64 = if long_ok { 1 } else if short_ok { -1 } else { 0 };
-                                if dir != 0 && !order_book.halt.load(Ordering::Relaxed) {
-                                    // Size scales with signal conviction beyond the gate, capped.
-                                    let conv = ((s_sig.abs() - tcfg.signal_thr_bps).max(0.0)
-                                                / tcfg.signal_thr_bps.max(0.1) + 1.0).min(tcfg.max_size_mult) as f64;
-                                    let risk = (tcfg.risk_frac as f64 * conv).min(1.0);
-                                    entry_margin = equity * risk;
-                                    let notional = entry_margin * tcfg.leverage as f64;
-                                    pos_size    = (notional / price as f64) as f32;
-                                    entry_price = price;
-                                    entry_time  = tick_now_ns;
-                                    pos_side    = dir;
-                                    best_price  = price;
-                                    let eidx = (order_book.round_trips.write_idx.load(Ordering::Relaxed) as usize) & RT_MASK;
-                                    (*order_book.signal.at_entry.get())[eidx] = s_sig;
-                                    order_book.net_position.fetch_add(dir, Ordering::Relaxed);
-                                    emit_latency_order(buffer, order_book, order_ring,
-                                        current_seq, tick_now_ns, tick_ptr.transit_est_ns);
-                                }
-                            } else {
-                                if pos_side == 1 { if price > best_price { best_price = price; } }
-                                else if price < best_price { best_price = price; }
-                                let move_bps = (price - entry_price) / entry_price * 10_000.0 * pos_side as f32;
-                                let trail_hit = if pos_side == 1 {
-                                    price <= best_price * (1.0 - tcfg.trail_bps / 10_000.0)
-                                } else {
-                                    price >= best_price * (1.0 + tcfg.trail_bps / 10_000.0)
-                                };
-                                let flip = if pos_side == 1 { s_sig < -tcfg.signal_exit_bps }
-                                           else { s_sig > tcfg.signal_exit_bps };
-                                let liq_bps    = 10_000.0 / tcfg.leverage.max(1.0);
-                                let liquidated = move_bps <= -liq_bps;
-                                let tp_hit = tcfg.tp_bps > 0.0 && move_bps >=  tcfg.tp_bps;
-                                let sl_hit = tcfg.sl_bps > 0.0 && move_bps <= -tcfg.sl_bps;
-                                if trail_hit || flip || tp_hit || sl_hit || liquidated {
-                                    let gross_bps  = move_bps as f64;
-                                    let notional   = entry_margin * tcfg.leverage as f64;
-                                    let fees_quote = notional * (2.0 * tcfg.fee_bps as f64 / 10_000.0);
-                                    let raw_pnl    = notional * (gross_bps / 10_000.0) - fees_quote;
-                                    let pnl_quote  = raw_pnl.max(-entry_margin);
-                                    let was_liq    = liquidated || raw_pnl <= -entry_margin;
-                                    equity += pnl_quote;
-                                    if equity <= 0.0 { equity = 0.0; ruined = true;
-                                        halt_trading(order_book, "account ruined (equity ≤ 0)"); }
-                                    let slot = order_book.round_trips.write_idx
-                                        .load(Ordering::Relaxed) as usize & RT_MASK;
-                                    let rt = &mut (*order_book.round_trips.entries.get())[slot];
-                                    rt.entry_time_ns = entry_time;
-                                    rt.exit_time_ns  = tick_now_ns;
-                                    rt.hold_ns       = tick_now_ns.saturating_sub(entry_time);
-                                    rt.side          = pos_side;
-                                    rt.entry_price   = entry_price;
-                                    rt.exit_price    = price;
-                                    rt.size          = pos_size;
-                                    rt.gross_bps     = gross_bps as f32;
-                                    rt.net_bps       = (gross_bps - 2.0 * tcfg.fee_bps as f64) as f32;
-                                    rt.pnl_quote     = pnl_quote as f32;
-                                    rt.fees_quote    = fees_quote as f32;
-                                    rt.flags         = if was_liq { 1.0 } else { 0.0 };
-                                    order_book.round_trips.write_idx.fetch_add(1, Ordering::Release);
-                                    order_book.net_position.fetch_add(-pos_side, Ordering::Relaxed);
-                                    emit_latency_order(buffer, order_book, order_ring,
-                                        current_seq, tick_now_ns, tick_ptr.transit_est_ns);
-                                    pos_side = 0;
+                        match decision {
+                            crate::model::Decision::Enter { side, signal_bps } => {
+                                let eidx = (order_book.round_trips.write_idx.load(Ordering::Relaxed) as usize) & RT_MASK;
+                                (*order_book.signal.at_entry.get())[eidx] = signal_bps;
+                                order_book.net_position.fetch_add(side, Ordering::Relaxed);
+                                emit_latency_order(buffer, order_book, order_ring,
+                                    current_seq, tick_now_ns, tick_ptr.transit_est_ns);
+                            }
+                            crate::model::Decision::Exit(rt) => {
+                                let slot = order_book.round_trips.write_idx.load(Ordering::Relaxed) as usize & RT_MASK;
+                                (*order_book.round_trips.entries.get())[slot] = rt;
+                                order_book.round_trips.write_idx.fetch_add(1, Ordering::Release);
+                                order_book.net_position.fetch_add(-rt.side, Ordering::Relaxed);
+                                emit_latency_order(buffer, order_book, order_ring,
+                                    current_seq, tick_now_ns, tick_ptr.transit_est_ns);
+                                if model.ruined && !order_book.halt.load(Ordering::Relaxed) {
+                                    halt_trading(order_book, "account ruined (equity ≤ 0)");
                                 }
                             }
+                            crate::model::Decision::None => {}
                         }
                     }
 

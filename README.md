@@ -311,6 +311,19 @@ HFT_TRADE=1 HFT_MOMENTUM=1 make live PAIR=XBT/USD   # set HFT_REF_PAIR=ETH/USD
 
 On a trending tape the difference is stark — going *with* the trend (~59% hit, ~break-even after fees) vs *against* it (~30% hit, deep loss). The JSON exposes `latest_signal_bps`, a `signal_series`, and per-trade `signal_at_entry`. New knobs: `HFT_W_TREND/W_FLOW/W_BASKET/W_LEADLAG`, `HFT_SIGNAL_THR_BPS`, `HFT_PULLBACK_BPS`, `HFT_TRAIL_BPS`, `HFT_REF_PAIR`.
 
+### Backtest sweep & cost-aware execution
+
+The model and backtester share one `AlphaModel` (single source of truth), so the sweep measures exactly what runs live. `trading-engine --backtest <capture>` runs the model over a capture **walk-forward** (continuous warm state; round-trips bucketed in-sample / out-of-sample by time) across a parameter grid, ranked by **out-of-sample** return:
+
+```bash
+make sweep                         # synth a capture, sweep, print the OOS-ranked table
+HFT_FEE_BPS=2.6 ./target/release/trading-engine --backtest recordings/two.krkr
+HFT_MAKER_BPS=-1 ./target/release/trading-engine --backtest recordings/two.krkr   # maker rebate
+HFT_NORMALIZE=1  ./target/release/trading-engine --backtest recordings/two.krkr   # z-scored signal
+```
+
+Cost-aware knobs (default to prior behavior): `HFT_MAKER` + `HFT_MAKER_BPS` (passive maker entry / rebate, taker exit), `HFT_FEE_GATE` + `HFT_MIN_EDGE_BPS` (only trade when the expected move clears the round-trip cost), `HFT_NORMALIZE` (z-score the signal terms so the cross-market weights matter). The honest result on the synth: taker fees lose, a maker rebate helps, and **z-scoring the signal is what flips the best config out-of-sample-positive** — a bigger lever than the fee. Point it at your recorded live captures for the real verdict.
+
 ---
 
 ## What isn't here

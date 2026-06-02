@@ -104,4 +104,13 @@ pub mod config {
     pub const TRAIL_BPS_DEFAULT:       f32 = 8.0;  // trailing-stop retrace from best price
     pub const SIGNAL_EXIT_BPS_DEFAULT: f32 = 0.0;  // exit when S weakens past this (0 = pure flip)
     pub const BETA_DEFAULT:            f32 = 1.0;  // lead-lag transfer coefficient
+
+    // ── Cost-aware execution (all default to current behavior when off) ──────
+    // Maker (passive) entry fee when HFT_MAKER=1 — you post a limit at the dip/
+    // pullback and pay maker (often a rebate, so negative) instead of taker; the
+    // exit still crosses (taker = FEE_BPS). Round-trip cost = maker + taker.
+    pub const MAKER_BPS_DEFAULT:    f32 = 0.0;   // entry-side fee under HFT_MAKER (can be negative)
+    // Fee-aware entry gate (HFT_FEE_GATE=1): require expected move ≥ round-trip
+    // cost + this buffer before entering. Kills structurally-doomed trades.
+    pub const MIN_EDGE_BPS_DEFAULT: f32 = 0.0;
 }

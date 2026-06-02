@@ -181,6 +181,12 @@ pub(crate) struct TradeCfg {
     pub trail_bps:       f32,  // trailing-stop retrace
     pub signal_exit_bps: f32,  // exit when S weakens past this
     pub beta:            f32,  // lead-lag transfer coefficient
+    // Cost-aware execution (default off → current behavior).
+    pub maker:           bool, // entry pays maker fee (passive) instead of taker
+    pub maker_bps:       f32,  // entry-side maker fee under `maker` (can be negative)
+    pub fee_gate:        bool, // require expected move ≥ round-trip cost + min_edge
+    pub min_edge_bps:    f32,  // edge buffer over cost for the fee gate
+    pub normalize:       bool, // z-score the composite-signal terms
 }
 
 /// One completed round-trip (entry → exit), the unit of the P&L scorecard.
