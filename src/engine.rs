@@ -608,6 +608,7 @@ fn scorecard(rts: &[models::RoundTrip], capital: f64) -> Option<Scorecard> {
 // Runs the SAME `AlphaModel` the live engine uses over a recorded capture, with an
 // in-sample/out-of-sample split and a small parameter grid, ranked by OOS return.
 
+#[derive(Copy, Clone)]
 struct BtTick { id: u8, price: f32, vol: f32, t_ns: u64 }
 
 fn load_capture(path: &str) -> std::io::Result<Vec<BtTick>> {
@@ -636,8 +637,12 @@ fn load_capture(path: &str) -> std::io::Result<Vec<BtTick>> {
 }
 
 // Run the model over a tick stream (id 1 = reference, 0 = traded) → round-trips.
-fn run_model(ticks: &[BtTick], cfg: models::TradeCfg) -> Vec<models::RoundTrip> {
-    let mut model = crate::model::AlphaModel::new(cfg);
+// When `policy` is Some, the learned MLP supplies the signal instead of the
+// hand-weighted composite (the gate / sizing / exit logic is identical).
+fn run_model(
+    ticks: &[BtTick], cfg: models::TradeCfg, policy: Option<crate::model::Policy>,
+) -> Vec<models::RoundTrip> {
+    let mut model = crate::model::AlphaModel::with_policy(cfg, policy);
     let mut rts = Vec::new();
     let mut seq: u64 = 0;
     for tk in ticks {
@@ -689,7 +694,7 @@ pub(crate) fn run_backtest(path: &str, base: models::TradeCfg) {
                     cfg.fee_gate = gate;
                     cfg.min_edge_bps = if gate { 2.0 } else { 0.0 };
                     // One continuous run; bucket round-trips by entry time.
-                    let full = run_model(&ticks, cfg);
+                    let full = run_model(&ticks, cfg, None);
                     let is_rts:  Vec<models::RoundTrip> = full.iter().copied().filter(|r| r.entry_time_ns <  t_split).collect();
                     let oos_rts: Vec<models::RoundTrip> = full.iter().copied().filter(|r| r.entry_time_ns >= t_split).collect();
                     let is_sc  = scorecard(&is_rts, cfg.capital as f64);
@@ -714,6 +719,154 @@ pub(crate) fn run_backtest(path: &str, base: models::TradeCfg) {
         println!("Best out-of-sample return: {:+.2}%  ({} configs; ranked by OOS, not in-sample)", oosr, rows.len());
     }
     println!("(maker fee = HFT_MAKER_BPS={:.1}; set HFT_NORMALIZE=1 to sweep the z-scored signal)", base.maker_bps);
+}
+
+// ── Train a learned policy by cross-entropy method (CEM) ─────────────────────
+// CEM is a gradient-free, embarrassingly-simple evolutionary search: keep a
+// Gaussian over the 65-param weight vector, sample a population, keep the elite
+// (best-fitness) fraction, refit the Gaussian to them, repeat. No autodiff, no
+// dependency — just the AlphaModel run forward over the in-sample ticks. The
+// fitness is a Sharpe-like score (penalized below a minimum trade count) so the
+// search prefers consistent edge over a few lucky outliers. Walk-forward: train
+// on the first 70% by time, report the held-out last 30%.
+
+// Deterministic splitmix64 → standard normal (Box–Muller), zero-dependency.
+struct Rng(u64);
+impl Rng {
+    fn u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn unit(&mut self) -> f32 { (self.u64() >> 11) as f32 / (1u64 << 53) as f32 }
+    fn normal(&mut self) -> f32 {
+        let u1 = self.unit().max(1e-9);
+        let u2 = self.unit();
+        (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+    }
+}
+
+// Sharpe-like fitness with a floor on trade count (a high Sharpe over a handful
+// of trades is noise, not edge). A run that never traded scores well below any
+// real one but stays finite, so the elite mean is meaningful.
+fn fitness(rts: &[models::RoundTrip], capital: f64) -> f64 {
+    const MIN_TRADES: usize = 30;
+    const NO_TRADE: f64 = -100.0;
+    match scorecard(rts, capital) {
+        None => NO_TRADE,
+        Some(sc) => {
+            if sc.ruined { return NO_TRADE; }
+            // Quadratic ramp below the floor so the search is pushed to trade
+            // enough to be statistically meaningful before chasing Sharpe.
+            let penalty = if sc.n < MIN_TRADES {
+                let r = sc.n as f64 / MIN_TRADES as f64;
+                r * r
+            } else { 1.0 };
+            // Reward risk-adjusted edge; tie-break toward higher return.
+            sc.sharpe * penalty + sc.return_pct * 1e-3
+        }
+    }
+}
+
+pub(crate) fn run_train(path: &str, base: models::TradeCfg) {
+    use crate::model::{Policy, N_PARAMS};
+    use rust_hft_software::config as cfgc;
+    let env_usize = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let pop     = env_usize("HFT_POP", cfgc::TRAIN_POP_DEFAULT);
+    let gens    = env_usize("HFT_GEN", cfgc::TRAIN_GEN_DEFAULT);
+    let elite_n = (pop / 8).max(4);
+    let seed    = std::env::var("HFT_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(cfgc::TRAIN_SEED_DEFAULT);
+    let out     = std::env::var("HFT_MODEL").unwrap_or_else(|_| cfgc::MODEL_PATH_DEFAULT.to_string());
+
+    let ticks = match load_capture(path) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("[train] {e}"); return; }
+    };
+    let split   = ticks.len() * 70 / 100;
+    let t_split = ticks.get(split).map(|t| t.t_ns).unwrap_or(u64::MAX);
+    let is_ticks:  Vec<BtTick> = ticks.iter().copied().filter(|t| t.t_ns <  t_split).collect();
+    let oos_ticks: Vec<BtTick> = ticks.iter().copied().filter(|t| t.t_ns >= t_split).collect();
+
+    let mut cfg = base;
+    cfg.enabled = true;
+    cfg.momentum = true;
+    let cap = cfg.capital as f64;
+
+    println!("[train] CEM  |  {} ticks ({} IS / {} OOS)  pop={pop} gens={gens} elite={elite_n} seed={seed}",
+             ticks.len(), is_ticks.len(), oos_ticks.len());
+    println!("        {} params (tiny MLP {}→{}→1), fitness = Sharpe (penalized < 30 trades)",
+             N_PARAMS, crate::model::N_FEATURES, 8);
+    println!("{}", "─".repeat(64));
+    println!("{:<5} {:>10} {:>10} {:>8}", "gen", "best fit", "elite μ", "IS n");
+    println!("{}", "─".repeat(64));
+
+    let mut rng = Rng(seed);
+    let mut mean = [0.0f32; N_PARAMS];
+    let mut std  = [0.5f32;  N_PARAMS];
+    let mut best_p = Policy { p: mean };
+    let mut best_fit = f64::MIN;
+
+    let mut samples: Vec<([f32; N_PARAMS], f64)> = Vec::with_capacity(pop);
+    for g in 0..gens {
+        samples.clear();
+        for _ in 0..pop {
+            let mut p = [0.0f32; N_PARAMS];
+            for k in 0..N_PARAMS { p[k] = mean[k] + std[k] * rng.normal(); }
+            let rts = run_model(&is_ticks, cfg, Some(Policy { p }));
+            samples.push((p, fitness(&rts, cap)));
+        }
+        samples.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Refit the Gaussian to the elite set.
+        let mut nm = [0.0f32; N_PARAMS];
+        let mut nv = [0.0f32; N_PARAMS];
+        for (p, _) in &samples[..elite_n] {
+            for k in 0..N_PARAMS { nm[k] += p[k]; }
+        }
+        for m in nm.iter_mut() { *m /= elite_n as f32; }
+        for (p, _) in &samples[..elite_n] {
+            for k in 0..N_PARAMS { let d = p[k] - nm[k]; nv[k] += d * d; }
+        }
+        for k in 0..N_PARAMS {
+            mean[k] = nm[k];
+            // Variance + a small floor so the search never fully collapses.
+            std[k] = (nv[k] / elite_n as f32).sqrt().max(0.02);
+        }
+        let (bp, bf) = samples[0];
+        if bf > best_fit { best_fit = bf; best_p = Policy { p: bp }; }
+        let elite_n_trades = run_model(&is_ticks, cfg, Some(Policy { p: bp })).len();
+        let mut mu = 0.0f64;
+        for (_, f) in &samples[..elite_n] { mu += *f; }
+        mu /= elite_n as f64;
+        println!("{:<5} {:>10.4} {:>10.4} {:>8}", g, bf, mu, elite_n_trades);
+    }
+    println!("{}", "─".repeat(64));
+
+    // Report the held-out OOS scorecard of the best policy.
+    let is_rts  = run_model(&is_ticks,  cfg, Some(best_p));
+    let oos_rts = run_model(&oos_ticks, cfg, Some(best_p));
+    let is_sc  = scorecard(&is_rts,  cap);
+    let oos_sc = scorecard(&oos_rts, cap);
+    let fmt = |s: &Option<Scorecard>| match s {
+        Some(sc) => format!("n={:<4} hit={:>5.1}%  ret={:>+7.2}%  sharpe={:>6.2}  PF={:>5.2}",
+                             sc.n, sc.hit_rate, sc.return_pct, sc.sharpe, sc.profit_factor),
+        None => "no trades".to_string(),
+    };
+    println!("  in-sample : {}", fmt(&is_sc));
+    println!("  out-sample: {}", fmt(&oos_sc));
+    let overfit = is_sc.as_ref().map(|s| s.return_pct).unwrap_or(0.0) > 0.0
+               && oos_sc.as_ref().map(|s| s.return_pct).unwrap_or(0.0) < 0.0;
+    if overfit { println!("  ⚠ overfit: in-sample positive, out-of-sample negative"); }
+
+    // Persist the best policy (raw little-endian f32 weights).
+    if let Some(dir) = std::path::Path::new(&out).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match std::fs::write(&out, best_p.to_le_bytes()) {
+        Ok(()) => println!("[train] wrote {} ({} bytes) — run with HFT_MODEL={}", out, N_PARAMS * 4, out),
+        Err(e) => eprintln!("[train] could not write {out}: {e}"),
+    }
 }
 
 fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
@@ -1257,6 +1410,7 @@ pub(crate) unsafe fn trading_strategy(
     reference: &models::RingBuffer,
     order_book: &models::OrderBook,
     order_ring: &models::OrderRing,
+    policy: Option<crate::model::Policy>,
 ) {
     unsafe {
         let mut last_processed_seq: u64 = 0;
@@ -1333,7 +1487,7 @@ pub(crate) unsafe fn trading_strategy(
         // The signal + execution live in AlphaModel (shared verbatim with the
         // --backtest sweep); the strategy just feeds it ticks and applies the
         // resulting side effects (latency order, round-trip log, net position).
-        let mut model = crate::model::AlphaModel::new(tcfg);
+        let mut model = crate::model::AlphaModel::with_policy(tcfg, policy);
         let mut ref_last_seq: u64 = 0;           // last reference cursor we sampled
         const SIG_SERIES_MASK: usize = SIGNAL_SERIES_LEN - 1;
         let mut sig_tick: u64 = 0;

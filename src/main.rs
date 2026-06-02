@@ -116,6 +116,24 @@ fn main() {
         engine::run_backtest(&path, trade_cfg);
         return;
     }
+    // Train a learned policy (CEM) over a capture and write it to HFT_MODEL.
+    if let Some(i) = args.iter().position(|a| a == "--train") {
+        let path = args.get(i + 1).cloned().unwrap_or_else(|| "recordings/two.krkr".to_string());
+        engine::run_train(&path, trade_cfg);
+        return;
+    }
+
+    // Optional learned policy: if HFT_MODEL points at a weights file, load it and
+    // let the tiny MLP supply the signal in place of the hand-weighted composite.
+    let policy = std::env::var("HFT_MODEL").ok().and_then(|path| {
+        match std::fs::read(&path) {
+            Ok(bytes) => match model::Policy::from_le_bytes(&bytes) {
+                Some(p) => { println!("[model] loaded learned policy from {path}"); Some(p) }
+                None => { eprintln!("[model] {path}: too small for a policy; ignoring"); None }
+            },
+            Err(e) => { eprintln!("[model] could not read {path}: {e}; using hand-weighted signal"); None }
+        }
+    });
 
     // Two ring buffers sharing one clock origin: slot 0 = the traded instrument
     // (drives the hot path, order ring, exchange, trade log), slot 1 = the
@@ -253,7 +271,7 @@ fn main() {
             // Affinity tag 1: hint the scheduler to keep the strategy thread on
             // the same P-core cluster throughout the session (item 6).
             engine::set_thread_affinity_tag(1);
-            unsafe { engine::trading_strategy(&buf, &rbuf, &ob, &ring); }
+            unsafe { engine::trading_strategy(&buf, &rbuf, &ob, &ring, policy); }
         }
     });
 

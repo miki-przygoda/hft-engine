@@ -193,6 +193,7 @@ src/
 ├── main.rs              # Thread orchestration, buffer pre-touch, startup
 ├── engine.rs            # Runtime logic: ingestor, exchange, watchdog, simulator, strategy, logging
 ├── models.rs            # Data structures: MarketTick, RingBuffer, TradeLog, OrderBook, OrderRing
+├── model.rs             # AlphaModel + learned Policy (tiny MLP): signal + execution, shared by live/backtest/train
 ├── lib.rs               # Shared config constants
 ├── bin/
 │   ├── fake-exchange.rs         # Standalone spin-poll UDP exchange (external round-trip measurement)
@@ -333,12 +334,27 @@ HFT_NORMALIZE=1  ./target/release/trading-engine --backtest recordings/two.krkr 
 
 Cost-aware knobs (default to prior behavior): `HFT_MAKER` + `HFT_MAKER_BPS` (passive maker entry / rebate, taker exit), `HFT_FEE_GATE` + `HFT_MIN_EDGE_BPS` (only trade when the expected move clears the round-trip cost), `HFT_NORMALIZE` (z-score the signal terms so the cross-market weights matter). The honest result on the synth: taker fees lose, a maker rebate helps, and **z-scoring the signal is what flips the best config out-of-sample-positive** — a bigger lever than the fee. Point it at your recorded live captures for the real verdict.
 
+### Learned policy (the model gives the signal, the algo does the work)
+
+Instead of hand-tuning the signal weights, train a **tiny neural net** on historical captures to produce the buy/sell signal — the same gate / pullback / sizing / trailing-exit machinery then executes it. The net is a **6 → 8 → 1 MLP (65 weights, 260 bytes)**: small enough to live in **L1**, branchless inference (~56 MACs + 8 `tanh`). Training is by **cross-entropy method** — a gradient-free evolutionary search, so still **zero dependencies** (no autodiff, no `rand`). It's walk-forward (train on the first 70% by time, report the held-out last 30% with an overfit flag) and deterministic.
+
+```bash
+make train                          # synth a capture, train, write models/policy.bin
+HFT_TRADE=1 ./target/release/trading-engine --train recordings/two.krkr   # → HFT_MODEL
+# then run the engine with the learned policy:
+HFT_EXTERNAL_FEED=1 HFT_TRADE=1 HFT_MOMENTUM=1 HFT_MODEL=models/policy.bin \
+    ./target/release/trading-engine &
+./target/release/kraken-feed --replay recordings/two.krkr
+```
+
+Knobs (defaults in `config`): `HFT_MODEL` (weights path), `HFT_POP` / `HFT_GEN` (CEM population / generations), `HFT_SEED`. Unset `HFT_MODEL` and the engine uses the hand-weighted signal — the learned path is purely additive. **Honesty:** CEM on a short capture overfits readily; the trade-count penalty and OOS report make that visible. Train on a long real capture and trust the out-of-sample column.
+
 ---
 
 ## What isn't here
 
 - **Kernel-bypass networking** — the live feed arrives over loopback UDP from the adapter; the next step for the data path is AF_XDP / DPDK and multicast reception (e.g. CME MDP 3.0).
-- **Calibrated signal logic** — the breakout signal is structurally sound and demonstrates the latency budget; the threshold is a tunable placeholder, not calibrated alpha.
+- **Calibrated signal logic** — the breakout signal is structurally sound and demonstrates the latency budget; the threshold is a tunable placeholder. The `--train` CEM path *does* learn a trading signal (a tiny L1-resident MLP) from captures; folding it onto the register-resident SIMD hot path is the next step.
 - **Real exchange connectivity** — the `OrderRing` has the right shape for draining to FIX/OUCH/binary protocol over a real NIC from a dedicated submission thread.
 - **Generic x86 fallback** — the x86_64 signal path requires AVX2; there is no runtime SSE/scalar fallback for older CPUs yet, and the affinity core map is tuned for the i9-9900K topology.
 

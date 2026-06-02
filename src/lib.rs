@@ -116,4 +116,14 @@ pub mod config {
     // Fee-aware entry gate (HFT_FEE_GATE=1): require expected move ≥ round-trip
     // cost + this buffer before entering. Kills structurally-doomed trades.
     pub const MIN_EDGE_BPS_DEFAULT: f32 = 0.0;
+
+    // ── Learned policy (HFT_MODEL / --train) ─────────────────────────────────
+    // A tiny MLP (6→8→1, 65 f32 weights — see model::Policy) supplies the signal
+    // S in place of the hand-weighted composite. Trained offline by cross-entropy
+    // method (`trading-engine --train <capture>`) and persisted as raw LE f32.
+    // The hyperparameters below are env-overridable (HFT_POP / HFT_GEN / HFT_SEED).
+    pub const TRAIN_POP_DEFAULT:  usize = 256; // CEM population per generation
+    pub const TRAIN_GEN_DEFAULT:  usize = 40;  // CEM generations
+    pub const TRAIN_SEED_DEFAULT: u64   = 0xC0FFEE; // RNG seed (deterministic runs)
+    pub const MODEL_PATH_DEFAULT: &str  = "models/policy.bin"; // weights file
 }

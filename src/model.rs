@@ -20,6 +20,51 @@ const FLOW_ALPHA: f32 = 1.0 / 16.0;
 const VOL_ALPHA:  f32 = 1.0 / 32.0;
 const VOL_FLOOR:  f32 = 0.1;
 
+// ── Learned policy (tiny MLP, L1-resident) ──────────────────────────────────
+// 6 standardized features → 8-unit tanh hidden → 1 linear output (the signal S
+// in bps). 65 f32 weights (260 bytes) — fits in L1; inference is ~56 MACs + 8
+// tanh, branchless. Trained offline by CEM (see engine::run_train).
+pub(crate) const N_FEATURES: usize = 6;
+const N_HIDDEN: usize = 8;
+pub(crate) const N_PARAMS: usize = N_FEATURES * N_HIDDEN + N_HIDDEN + N_HIDDEN + 1; // 65
+
+#[derive(Copy, Clone)]
+pub(crate) struct Policy {
+    pub(crate) p: [f32; N_PARAMS],
+}
+
+impl Policy {
+    // Layout: [0..48] w1 (hidden×features), [48..56] b1, [56..64] w2, [64] b2.
+    #[inline(always)]
+    pub(crate) fn forward(&self, x: &[f32; N_FEATURES]) -> f32 {
+        let p = &self.p;
+        let mut out = p[64];
+        for j in 0..N_HIDDEN {
+            let mut s = p[48 + j];
+            let base = j * N_FEATURES;
+            for i in 0..N_FEATURES { s += p[base + i] * x[i]; }
+            out += p[56 + j] * s.tanh();
+        }
+        out
+    }
+
+    pub(crate) fn to_le_bytes(self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(N_PARAMS * 4);
+        for w in &self.p { b.extend_from_slice(&w.to_le_bytes()); }
+        b
+    }
+
+    pub(crate) fn from_le_bytes(b: &[u8]) -> Option<Policy> {
+        if b.len() < N_PARAMS * 4 { return None; }
+        let mut p = [0.0; N_PARAMS];
+        for (i, w) in p.iter_mut().enumerate() {
+            *w = f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().ok()?);
+        }
+        Some(Policy { p })
+    }
+}
+
+
 /// What the model decided on a tick. The caller turns this into side effects.
 pub(crate) enum Decision {
     None,
@@ -44,6 +89,10 @@ pub(crate) struct AlphaModel {
     scale_trend: f32,
     scale_basket: f32,
     scale_leadlag: f32,
+    // Learned policy (when present, replaces the hand-weighted signal) + rolling
+    // |feature| scales so the MLP sees standardized, well-conditioned inputs.
+    policy: Option<Policy>,
+    feat_scale: [f32; N_FEATURES],
     // Position / capital.
     pub(crate) pos_side: i64, // 0 flat, +1 long, -1 short
     entry_price: f32,
@@ -57,7 +106,7 @@ pub(crate) struct AlphaModel {
 }
 
 impl AlphaModel {
-    pub(crate) fn new(cfg: TradeCfg) -> Self {
+    pub(crate) fn with_policy(cfg: TradeCfg, policy: Option<Policy>) -> Self {
         AlphaModel {
             cfg,
             fast_ema: [0.0; 2], slow_ema: [0.0; 2], ema_init: [false; 2],
@@ -65,6 +114,7 @@ impl AlphaModel {
             flow_ema: 0.0, flow_norm: 1.0,
             vol_ema: 0.0, vol_prev: 0.0, vol_init: false,
             scale_trend: 1.0, scale_basket: 1.0, scale_leadlag: 1.0,
+            policy, feat_scale: [1.0; N_FEATURES],
             pos_side: 0, entry_price: 0.0, entry_time: 0, pos_size: 0.0,
             entry_margin: 0.0, best_price: 0.0,
             equity: cfg.capital as f64, ruined: false, latest_signal: 0.0,
@@ -118,20 +168,36 @@ impl AlphaModel {
         let flow_term = (self.flow_ema / self.flow_norm.max(1e-6)).clamp(-3.0, 3.0) * 3.0;
         let leadlag = self.ref_ret_ema * self.cfg.beta;
 
-        // Optional z-score: divide each unbounded term by its rolling |value| and
-        // re-express in bps via the realized-vol unit, so the weights are comparable.
-        let (t0, t1, ll) = if self.cfg.normalize {
-            self.scale_trend   += (trend0.abs()  - self.scale_trend)   * SLOW_ALPHA;
-            self.scale_basket  += (trend1.abs()  - self.scale_basket)  * SLOW_ALPHA;
-            self.scale_leadlag += (leadlag.abs() - self.scale_leadlag) * SLOW_ALPHA;
-            let unit = self.vol_ema.max(VOL_FLOOR);
-            ( trend0  / self.scale_trend.max(1e-6)   * unit,
-              trend1  / self.scale_basket.max(1e-6)  * unit,
-              leadlag / self.scale_leadlag.max(1e-6) * unit )
-        } else { (trend0, trend1, leadlag) };
-
-        let s = self.cfg.w_trend * t0 + self.cfg.w_flow * flow_term
-              + self.cfg.w_basket * t1 + self.cfg.w_leadlag * ll;
+        let s = if let Some(pol) = self.policy.as_ref() {
+            // ── Learned policy ──────────────────────────────────────────────
+            // Six raw features, each standardized by a rolling |value| EMA so
+            // the MLP sees O(1)-scaled, well-conditioned inputs regardless of
+            // the absolute price/vol regime. Output is the signal S in bps.
+            let pull = if self.fast_ema[0] > 0.0 {
+                (price - self.fast_ema[0]) / self.fast_ema[0] * 10_000.0 } else { 0.0 };
+            let raw = [trend0, pull, flow_term, trend1, self.ref_ret_ema, self.vol_ema];
+            let mut x = [0.0f32; N_FEATURES];
+            for k in 0..N_FEATURES {
+                self.feat_scale[k] += (raw[k].abs() - self.feat_scale[k]) * SLOW_ALPHA;
+                x[k] = raw[k] / self.feat_scale[k].max(1e-6);
+            }
+            pol.forward(&x)
+        } else {
+            // ── Hand-weighted composite (default) ───────────────────────────
+            // Optional z-score: divide each unbounded term by its rolling |value|
+            // and re-express in bps via the realized-vol unit, so weights compare.
+            let (t0, t1, ll) = if self.cfg.normalize {
+                self.scale_trend   += (trend0.abs()  - self.scale_trend)   * SLOW_ALPHA;
+                self.scale_basket  += (trend1.abs()  - self.scale_basket)  * SLOW_ALPHA;
+                self.scale_leadlag += (leadlag.abs() - self.scale_leadlag) * SLOW_ALPHA;
+                let unit = self.vol_ema.max(VOL_FLOOR);
+                ( trend0  / self.scale_trend.max(1e-6)   * unit,
+                  trend1  / self.scale_basket.max(1e-6)  * unit,
+                  leadlag / self.scale_leadlag.max(1e-6) * unit )
+            } else { (trend0, trend1, leadlag) };
+            self.cfg.w_trend * t0 + self.cfg.w_flow * flow_term
+                + self.cfg.w_basket * t1 + self.cfg.w_leadlag * ll
+        };
         self.latest_signal = s;
 
         if !warmed || self.ruined { return Decision::None; }

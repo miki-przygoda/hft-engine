@@ -83,7 +83,7 @@ src/
 ├── main.rs                          # Thread orchestration, buffer pre-touch, startup
 ├── engine.rs                        # Runtime: ingestor, exchange, watchdog, simulator, strategy, logging
 ├── models.rs                        # Data structures: MarketTick, RingBuffer, TradeLog, LatencyHistogram, OrderBook, OrderRing
-├── model.rs                         # AlphaModel: trend/cross-market signal + execution (shared by live & --backtest)
+├── model.rs                         # AlphaModel + learned Policy (tiny MLP): signal + execution (shared by live, --backtest, --train)
 ├── lib.rs                           # Shared config constants (rust_hft_software::config)
 ├── bin/
 │   ├── market-simulator.rs          # Standalone UDP packet sender (warmup + real packets)
@@ -655,6 +655,58 @@ pointing it at the user's recorded *live* captures.
 
 ---
 
+## Learned policy (`HFT_MODEL` / `--train`)
+
+Instead of hand-tuning the composite-signal weights, the signal `S` can be
+produced by a **tiny neural net trained offline on historical captures**. The net
+gives the buy/sell call; the same gate / pullback-timing / sizing / trailing-exit
+machinery (above) does the rest — *"the model gives the signal, the algo does the
+work."* It's deliberately small enough to be **L1-resident** so it costs nothing on
+the hot path.
+
+### The policy (`src/model.rs::Policy`)
+A **6 → 8 → 1 MLP**: 6 standardized features → 8-unit `tanh` hidden layer → 1
+linear output (the signal `S`, in bps). That's **65 `f32` weights = 260 bytes** —
+it fits in L1, and inference is ~56 multiply-adds + 8 `tanh`, fully branchless. The
+six features (each standardized by a rolling `|value|` EMA so the net sees
+O(1)-scaled inputs in any price/vol regime) are: own trend, pullback vs the fast
+EMA, normalized order flow, reference trend, reference lead-lag return, and
+realized vol. When `AlphaModel` holds a `Policy`, `S = policy.forward(features)`
+*replaces* the hand-weighted composite; everything downstream is unchanged.
+
+### Training — `trading-engine --train <capture.krkr>`
+Training is by **cross-entropy method (CEM)** — a gradient-free evolutionary
+search, so there's no autodiff and still **zero dependencies**. Keep a Gaussian
+over the 65-weight vector; each generation sample a population, keep the elite
+(best-fitness) fraction, refit the Gaussian, repeat. Fitness is a **Sharpe-like**
+score with a quadratic penalty below 30 trades (a high Sharpe over a handful of
+trades is noise, not edge). Walk-forward: train on the first 70% by time, report
+the held-out last 30% (with an overfit flag). The best policy is persisted as raw
+little-endian `f32`. Deterministic (seeded) → reproducible runs.
+
+```bash
+# Train over a capture, then run the engine with the learned policy:
+HFT_TRADE=1 ./target/release/trading-engine --train recordings/two.krkr   # → models/policy.bin
+HFT_EXTERNAL_FEED=1 HFT_TRADE=1 HFT_MOMENTUM=1 HFT_MODEL=models/policy.bin \
+    ./target/release/trading-engine &
+./target/release/kraken-feed --replay recordings/two.krkr
+# or: make train         (synth + train)
+```
+
+**Config** (env-overridable; defaults in `config`): `HFT_MODEL` (weights path —
+load at startup, write target for `--train`), `HFT_POP` (population, 256),
+`HFT_GEN` (generations, 40), `HFT_SEED` (RNG seed). If `HFT_MODEL` is unset the
+engine uses the hand-weighted signal as before — the learned path is purely
+additive.
+
+> **Honesty.** CEM on a short capture overfits readily (high in-sample Sharpe over
+> a few trades); the trade-count penalty and the out-of-sample report exist to make
+> that visible rather than hide it. As with the rest of the project, the value is
+> the *measurement* — point `--train` at a long real capture and trust the OOS
+> column, not the in-sample one.
+
+---
+
 ## Timing primitive
 
 `elapsed_ns(start: &Instant) -> u64` is the single source of time, calling
@@ -738,9 +790,11 @@ are behind `#[cfg(target_os = "linux")]`.
    networking (AF_XDP / DPDK) and multicast reception (e.g. CME MDP 3.0), keeping
    the single-writer-per-`latest_idx` invariant. Consider one `RingBuffer` per
    instrument (the scaffold is in place).
-2. **Calibrated signal logic** — the NEON/AVX2 momentum path is structurally
-   correct but the threshold is a placeholder. Real signals (momentum, VWAP
-   deviation) should stay register-resident and branchless.
+2. **Calibrated signal logic** — *partially delivered:* the `--train` CEM path
+   learns the trading signal (a tiny L1-resident MLP) from historical captures
+   (see *Learned policy*). The NEON/AVX2 *breakout* path is still a placeholder
+   threshold. Next: train on long real captures, then fold the learned policy onto
+   the register-resident SIMD hot path (the MLP inference is small enough).
 3. **Real order submission** — drain the `OrderRing` to FIX / OUCH / an
    exchange-native binary protocol over a real NIC from a dedicated submission
    thread (the ring already has the right shape).

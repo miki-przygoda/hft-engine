@@ -6,7 +6,9 @@ PAIR   ?= XBT/USD
 DUR    ?= 30
 SAMPLE ?= recordings/sample.krkr
 
-.PHONY: help build test bench run synth replay live sweep clean
+MODEL  ?= models/policy.bin
+
+.PHONY: help build test bench run synth replay live sweep train clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -41,6 +43,14 @@ ifndef FILE
 	./target/release/kraken-feed --synth $(SAMPLE)
 endif
 	./target/release/trading-engine --backtest $(if $(FILE),$(FILE),$(SAMPLE))
+
+train: build ## Train a learned policy (CEM) over a capture → MODEL=$(MODEL). FILE=path optional
+	@mkdir -p recordings models
+ifndef FILE
+	./target/release/kraken-feed --synth $(SAMPLE)
+endif
+	HFT_TRADE=1 HFT_MODEL=$(MODEL) ./target/release/trading-engine --train $(if $(FILE),$(FILE),$(SAMPLE))
+	@echo "→ run it:  HFT_EXTERNAL_FEED=1 HFT_TRADE=1 HFT_MOMENTUM=1 HFT_MODEL=$(MODEL) ./target/release/trading-engine"
 
 clean: ## Remove build artifacts
 	cargo clean

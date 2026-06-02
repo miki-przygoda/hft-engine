@@ -30,3 +30,6 @@ TODOs/
 
 # Local feed captures (regenerate with: kraken-feed --synth, or --record live)
 recordings/
+
+# Trained policy weights (regenerate with: trading-engine --train)
+models/
