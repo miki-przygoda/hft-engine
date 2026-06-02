@@ -371,7 +371,10 @@ fn run_replay(path: &str, ingestor: &str) -> io::Result<()> {
 /// reproducible. Override the seed with HFT_SYNTH_SEED for a different path.
 fn run_synth(path: &str) -> io::Result<()> {
     let mut rec = Recorder::create(path)?;
-    let n = 3000u64;
+    // Per-market tick count (HFT_SYNTH_TICKS); default 3000. Use a large value for
+    // a long "day"-length session, e.g. HFT_SYNTH_TICKS=100000.
+    let n: u64 = std::env::var("HFT_SYNTH_TICKS").ok()
+        .and_then(|s| s.trim().parse().ok()).unwrap_or(3000);
 
     let mut seed: u64 = std::env::var("HFT_SYNTH_SEED").ok()
         .and_then(|s| s.trim().parse().ok()).unwrap_or(0x5DEECE66D);
