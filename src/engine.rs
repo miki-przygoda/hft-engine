@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::{models, BUFFER_SIZE, ORDER_RING_SIZE, ROUND_TRIP_LOG_SIZE, TRADE_LOG_SIZE};
+use crate::{models, BUFFER_SIZE, ORDER_RING_SIZE, ROUND_TRIP_LOG_SIZE, SIGNAL_SERIES_LEN, TRADE_LOG_SIZE};
 use rust_hft_software::config::{
     BURST_GAP_MS, BURST_SIZE, CLEAN_SEQ_THRESHOLD, INGESTOR_ADDR,
     MAX_GAP_COUNT, MAX_POSITION, NUM_BURSTS, SIGNAL_MOMENTUM_BPS, WARMUP_PACKETS,
@@ -277,7 +277,8 @@ unsafe fn emit_latency_order(
 }
 
 pub(crate) fn run_ingestor(
-    buffer: Arc<models::RingBuffer>,
+    traded: Arc<models::RingBuffer>,
+    reference: Arc<models::RingBuffer>,
     order_book: Arc<models::OrderBook>,
     last_packet_ns: Arc<AtomicU64>,
     ready: Arc<AtomicBool>,
@@ -286,47 +287,53 @@ pub(crate) fn run_ingestor(
     socket.set_nonblocking(true).expect("ingestor: failed to set non-blocking");
     ready.store(true, Ordering::Release);
 
-    let mut seq: u64 = 1;
-    let mut last_ingest_seq: u64 = 0;
+    // Per-instrument write cursors: slot 0 = traded, slot 1 = reference. v3 packets
+    // (>= 33 bytes) carry the instrument id at byte 32; older packets are slot 0.
+    let mut seq:             [u64; 2] = [1, 1];
+    let mut last_ingest_seq: [u64; 2] = [0, 0];
     let mut pkt = [0u8; 64];
 
     loop {
         match socket.recv_from(&mut pkt) {
             Ok((amt, _)) if amt >= 16 => {
+                let id = if amt >= 33 && (pkt[32] as usize) < 2 { pkt[32] as usize } else { 0 };
+                let buffer: &models::RingBuffer = if id == 0 { &traded } else { &reference };
+
                 let recv_seq = u64::from_le_bytes(pkt[8..16].try_into().unwrap());
 
-                // Sequence gap detection: if the packet sequence is not the expected
-                // next value, set the dirty flag so the strategy skips trading on
-                // potentially stale or reordered data.
-                if last_ingest_seq > 0 && recv_seq != last_ingest_seq + 1 {
+                // Sequence-gap detection. Only the TRADED instrument (slot 0) trips
+                // the risk dirty flag — a reference-feed gap degrades the cross
+                // signal but must not halt trading.
+                if last_ingest_seq[id] > 0 && recv_seq != last_ingest_seq[id] + 1 && id == 0 {
                     order_book.gap_count.fetch_add(1, Ordering::Relaxed);
                     order_book.dirty.store(true, Ordering::Relaxed);
                 }
-                last_ingest_seq = recv_seq;
+                last_ingest_seq[id] = recv_seq;
 
-                // Track the observed price range (sole writer: ingestor) for the
-                // shutdown report — helps calibrate the target-price level.
-                let px = f32::from_le_bytes(pkt[0..4].try_into().unwrap());
-                if px.is_finite() {
-                    if px < f32::from_bits(order_book.price_lo_bits.load(Ordering::Relaxed)) {
-                        order_book.price_lo_bits.store(px.to_bits(), Ordering::Relaxed);
-                    }
-                    if px > f32::from_bits(order_book.price_hi_bits.load(Ordering::Relaxed)) {
-                        order_book.price_hi_bits.store(px.to_bits(), Ordering::Relaxed);
+                // Observed price range tracked for the traded instrument only.
+                if id == 0 {
+                    let px = f32::from_le_bytes(pkt[0..4].try_into().unwrap());
+                    if px.is_finite() {
+                        if px < f32::from_bits(order_book.price_lo_bits.load(Ordering::Relaxed)) {
+                            order_book.price_lo_bits.store(px.to_bits(), Ordering::Relaxed);
+                        }
+                        if px > f32::from_bits(order_book.price_hi_bits.load(Ordering::Relaxed)) {
+                            order_book.price_hi_bits.store(px.to_bits(), Ordering::Relaxed);
+                        }
                     }
                 }
 
-                let idx = (seq & BUFFER_MASK) as usize;
+                let s = seq[id];
+                let idx = (s & BUFFER_MASK) as usize;
                 let ingest_time_ns = elapsed_ns(&buffer.start_time);
 
                 unsafe {
                     let tick_ptr = &buffer.ticks[idx] as *const _ as *mut u8;
                     std::ptr::copy_nonoverlapping(pkt.as_ptr(), tick_ptr, 16);
                     *(tick_ptr.add(16) as *mut u64) = ingest_time_ns;
-                    // v2 packets (>= 32 bytes) carry the exchange origin timestamp
-                    // and the RTT/2 transit estimate; legacy 16-byte packets leave
-                    // both zero. All writes precede the Release store below, so the
-                    // strategy sees them after its Acquire load (invariant #8).
+                    // v2+ packets (>= 32 bytes) carry origin_ts + transit_est. All
+                    // writes precede the Release store, so the strategy sees them
+                    // after its Acquire load (invariant #8).
                     if amt >= 32 {
                         *(tick_ptr.add(24) as *mut u64) =
                             u64::from_le_bytes(pkt[16..24].try_into().unwrap());
@@ -338,9 +345,9 @@ pub(crate) fn run_ingestor(
                     }
                 }
 
-                buffer.latest_idx.store(seq, Ordering::Release);
+                buffer.latest_idx.store(s, Ordering::Release);
                 last_packet_ns.store(ingest_time_ns, Ordering::Relaxed);
-                seq += 1;
+                seq[id] += 1;
             }
             _ => std::hint::spin_loop(),
         }
@@ -695,12 +702,20 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
         let rts = &rts_all[..rt_count];
         let cfg = order_book.trade_cfg;
         let vol = f32::from_bits(order_book.vol_ema_bits.load(Ordering::Relaxed));
+        let sig = f32::from_bits(order_book.latest_signal_bits.load(Ordering::Relaxed));
         println!("{}", "─".repeat(72));
-        let rule = if cfg.adaptive { "ADAPTIVE (entry 1σ/TP 1.5σ/SL 2.5σ)".to_string() }
-                   else { format!("entry {:.1}/TP {:.1}/SL {:.1} bps", cfg.entry_dip_bps, cfg.tp_bps, cfg.sl_bps) };
-        println!("TRADING SCORECARD  ({} mean-reversion, {}{}, {:.0}x lev, {:.1} bps/side fee)",
-                 if cfg.allow_short { "long&short" } else { "long-only" }, rule,
-                 if cfg.use_flow { " +order-flow" } else { "" }, cfg.leverage, cfg.fee_bps);
+        if cfg.momentum {
+            println!("TRADING SCORECARD  ({} TREND-FOLLOWING + cross-market, {:.0}x lev, {:.1} bps/side fee)",
+                     if cfg.allow_short { "long&short" } else { "long-only" }, cfg.leverage, cfg.fee_bps);
+            println!("Signal: S = {:.1}·trend + {:.1}·flow + {:.1}·basket + {:.1}·leadlag   gate ±{:.1} bps   latest S {:+.2} bps",
+                     cfg.w_trend, cfg.w_flow, cfg.w_basket, cfg.w_leadlag, cfg.signal_thr_bps, sig);
+        } else {
+            let rule = if cfg.adaptive { "ADAPTIVE (entry 1σ/TP 1.5σ/SL 2.5σ)".to_string() }
+                       else { format!("entry {:.1}/TP {:.1}/SL {:.1} bps", cfg.entry_dip_bps, cfg.tp_bps, cfg.sl_bps) };
+            println!("TRADING SCORECARD  ({} mean-reversion, {}{}, {:.0}x lev, {:.1} bps/side fee)",
+                     if cfg.allow_short { "long&short" } else { "long-only" }, rule,
+                     if cfg.use_flow { " +order-flow" } else { "" }, cfg.leverage, cfg.fee_bps);
+        }
         if lo.is_finite() && hi.is_finite() {
             let range_bps = if lo > 0.0 { (hi - lo) / lo * 10_000.0 } else { 0.0 };
             println!("Observed price range: [{:.2}, {:.2}]  ({:.1} bps span)  |  volatility ~{:.2} bps/tick",
@@ -945,12 +960,17 @@ fn write_log(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
         let rts = &rts_all[..rt_count];
         let cfg = order_book.trade_cfg;
         json.push_str("  \"trading\": {\n");
-        json.push_str(&format!("    \"enabled\": true, \"allow_short\": {}, \"adaptive\": {}, \"use_flow\": {},\n",
-            cfg.allow_short, cfg.adaptive, cfg.use_flow));
+        json.push_str(&format!("    \"enabled\": true, \"momentum\": {}, \"allow_short\": {}, \"adaptive\": {}, \"use_flow\": {},\n",
+            cfg.momentum, cfg.allow_short, cfg.adaptive, cfg.use_flow));
         json.push_str(&format!("    \"leverage\": {}, \"fee_bps\": {}, \"capital\": {}, \"risk_frac\": {},\n",
             cfg.leverage, cfg.fee_bps, cfg.capital, cfg.risk_frac));
         json.push_str(&format!("    \"entry_dip_bps\": {}, \"tp_bps\": {}, \"sl_bps\": {},\n",
             cfg.entry_dip_bps, cfg.tp_bps, cfg.sl_bps));
+        if cfg.momentum {
+            json.push_str(&format!("    \"w_trend\": {}, \"w_flow\": {}, \"w_basket\": {}, \"w_leadlag\": {}, \"signal_thr_bps\": {}, \"pullback_bps\": {}, \"trail_bps\": {}, \"latest_signal_bps\": {:.4},\n",
+                cfg.w_trend, cfg.w_flow, cfg.w_basket, cfg.w_leadlag, cfg.signal_thr_bps, cfg.pullback_bps, cfg.trail_bps,
+                f32::from_bits(order_book.latest_signal_bits.load(Ordering::Relaxed))));
+        }
         match scorecard(rts, cfg.capital as f64) {
             Some(s) => {
                 json.push_str(&format!("    \"round_trips\": {}, \"longs\": {}, \"shorts\": {}, \"liquidations\": {},\n",
@@ -980,14 +1000,24 @@ fn write_log(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
         }
         json.push_str("],\n");
 
+        let sig_at_entry = unsafe { &*order_book.signal.at_entry.get() };
         json.push_str("  \"round_trip_log\": [\n");
         for (i, t) in rts.iter().enumerate() {
             let comma = if i + 1 < rt_count { "," } else { "" };
             json.push_str(&format!(
-                "    {{\"side\": {}, \"entry_price\": {}, \"exit_price\": {}, \"size\": {}, \"gross_bps\": {:.4}, \"net_bps\": {:.4}, \"pnl_quote\": {:.4}, \"hold_ns\": {}}}{}\n",
-                t.side, t.entry_price, t.exit_price, t.size, t.gross_bps, t.net_bps, t.pnl_quote, t.hold_ns, comma));
+                "    {{\"side\": {}, \"entry_price\": {}, \"exit_price\": {}, \"size\": {}, \"gross_bps\": {:.4}, \"net_bps\": {:.4}, \"pnl_quote\": {:.4}, \"hold_ns\": {}, \"signal_at_entry\": {:.4}}}{}\n",
+                t.side, t.entry_price, t.exit_price, t.size, t.gross_bps, t.net_bps, t.pnl_quote, t.hold_ns, sig_at_entry[i], comma));
         }
         json.push_str("  ],\n");
+
+        // Downsampled composite-signal series (the buy/sell signal over time).
+        let scount = (order_book.signal.series_idx.load(Ordering::Acquire) as usize).min(SIGNAL_SERIES_LEN);
+        let series = unsafe { &*order_book.signal.series.get() };
+        json.push_str("  \"signal_series\": [");
+        for (i, v) in series[..scount].iter().enumerate() {
+            json.push_str(&format!("{}{:.3}", if i > 0 { ", " } else { "" }, v));
+        }
+        json.push_str("],\n");
     }
 
     json.push_str("  \"trades\": [\n");
@@ -1112,6 +1142,7 @@ pub(crate) fn run_market_simulator(ingestor_ready: Arc<AtomicBool>) {
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
 pub(crate) unsafe fn trading_strategy(
     buffer: &models::RingBuffer,
+    reference: &models::RingBuffer,
     order_book: &models::OrderBook,
     order_ring: &models::OrderRing,
 ) {
@@ -1185,6 +1216,22 @@ pub(crate) unsafe fn trading_strategy(
         let mut equity:    f64  = tcfg.capital as f64;
         let mut entry_margin: f64 = 0.0;   // capital at risk on the open position
         let mut ruined:    bool = false;
+
+        // ── Trend-following + cross-market signal state (HFT_MOMENTUM) ───────
+        // Per-instrument fast/slow EMAs for a trend measure: [0]=traded, [1]=reference.
+        const FAST_ALPHA: f32 = 1.0 / 16.0;
+        const SLOW_ALPHA: f32 = 1.0 / 128.0;
+        let mut fast_ema: [f32; 2] = [0.0, 0.0];
+        let mut slow_ema: [f32; 2] = [0.0, 0.0];
+        let mut ema_init: [bool; 2] = [false, false];
+        let mut ref_prev_px: f32 = 0.0;          // reference last price (for its return)
+        let mut ref_ret_ema: f32 = 0.0;          // EMA of reference per-tick return (bps)
+        let mut ref_last_seq: u64 = 0;           // last reference cursor we sampled
+        let mut flow_norm:   f32 = 1.0;          // rolling |flow| scale, normalizes flow term
+        let mut best_price:  f32 = 0.0;          // trailing-stop high/low water mark
+        // Downsampled signal series + per-trade signal at entry.
+        const SIG_SERIES_MASK: usize = SIGNAL_SERIES_LEN - 1;
+        let mut sig_tick: u64 = 0;
 
         // Pending simulated fills (FIFO ring). When we send an order we don't know
         // the fill price yet — it's the market price one transit later. Each entry
@@ -1469,13 +1516,142 @@ pub(crate) unsafe fn trading_strategy(
                         }
                     }
 
+                    // ── Trend-following + cross-market signal (HFT_MOMENTUM) ─────
+                    // Compute a composite buy/sell signal S each tick from own trend
+                    // (fast vs slow EMA), own order flow, the reference market's trend
+                    // (basket), and the reference's recent return (lead-lag). Trade
+                    // WITH the trend but time entries on a pullback vs the fast EMA;
+                    // exit on signal-flip or a trailing stop (TP/SL/liq as caps).
+                    if tcfg.enabled && tcfg.momentum {
+                        // Sample the reference market (read-only across its cursor).
+                        let ref_seq = reference.latest_idx.load(Ordering::Acquire);
+                        if ref_seq > 0 && ref_seq != ref_last_seq {
+                            ref_last_seq = ref_seq;
+                            let rpx = reference.ticks[(ref_seq & BUFFER_MASK) as usize].price;
+                            if ema_init[1] {
+                                fast_ema[1] += (rpx - fast_ema[1]) * FAST_ALPHA;
+                                slow_ema[1] += (rpx - slow_ema[1]) * SLOW_ALPHA;
+                                let rret = if ref_prev_px > 0.0 {
+                                    (rpx - ref_prev_px) / ref_prev_px * 10_000.0 } else { 0.0 };
+                                ref_ret_ema += (rret - ref_ret_ema) * FAST_ALPHA;
+                            } else {
+                                fast_ema[1] = rpx; slow_ema[1] = rpx; ema_init[1] = true;
+                            }
+                            ref_prev_px = rpx;
+                        }
+                        // Traded-instrument EMAs, order flow, volatility.
+                        if ema_init[0] {
+                            fast_ema[0] += (price - fast_ema[0]) * FAST_ALPHA;
+                            slow_ema[0] += (price - slow_ema[0]) * SLOW_ALPHA;
+                        } else { fast_ema[0] = price; slow_ema[0] = price; ema_init[0] = true; }
+                        flow_ema  += (tick_ptr.volume - flow_ema) * FLOW_ALPHA;
+                        flow_norm += (tick_ptr.volume.abs() - flow_norm) * SLOW_ALPHA;
+                        if vol_init {
+                            let ret = ((price - vol_prev) / vol_prev * 10_000.0).abs();
+                            vol_ema += (ret - vol_ema) * VOL_ALPHA;
+                        } else { vol_init = true; }
+                        vol_prev = price;
+                        order_book.vol_ema_bits.store(vol_ema.to_bits(), Ordering::Relaxed);
+
+                        // Composite signal S (bps-comparable).
+                        let trend0 = if slow_ema[0] > 0.0 { (fast_ema[0]-slow_ema[0])/slow_ema[0]*10_000.0 } else { 0.0 };
+                        let trend1 = if slow_ema[1] > 0.0 { (fast_ema[1]-slow_ema[1])/slow_ema[1]*10_000.0 } else { 0.0 };
+                        let flow_term = (flow_ema / flow_norm.max(1e-6)).clamp(-3.0, 3.0) * 3.0;
+                        let leadlag   = ref_ret_ema * tcfg.beta;
+                        let s_sig = tcfg.w_trend * trend0 + tcfg.w_flow * flow_term
+                                  + tcfg.w_basket * trend1 + tcfg.w_leadlag * leadlag;
+                        order_book.latest_signal_bits.store(s_sig.to_bits(), Ordering::Relaxed);
+                        sig_tick += 1;
+                        if sig_tick & 7 == 0 {
+                            let si = (order_book.signal.series_idx.load(Ordering::Relaxed) as usize) & SIG_SERIES_MASK;
+                            (*order_book.signal.series.get())[si] = s_sig;
+                            order_book.signal.series_idx.fetch_add(1, Ordering::Relaxed);
+                        }
+
+                        if current_seq > WARMUP_PACKETS && !ruined {
+                            let bullish = s_sig >  tcfg.signal_thr_bps;
+                            let bearish = s_sig < -tcfg.signal_thr_bps;
+                            let pb = tcfg.pullback_bps / 10_000.0;
+                            if pos_side == 0 {
+                                // Trend + pullback timing: buy a dip in an uptrend, short a rip in a downtrend.
+                                let long_ok  = bullish && price <= fast_ema[0] * (1.0 - pb);
+                                let short_ok = bearish && tcfg.allow_short && price >= fast_ema[0] * (1.0 + pb);
+                                let dir: i64 = if long_ok { 1 } else if short_ok { -1 } else { 0 };
+                                if dir != 0 && !order_book.halt.load(Ordering::Relaxed) {
+                                    // Size scales with signal conviction beyond the gate, capped.
+                                    let conv = ((s_sig.abs() - tcfg.signal_thr_bps).max(0.0)
+                                                / tcfg.signal_thr_bps.max(0.1) + 1.0).min(tcfg.max_size_mult) as f64;
+                                    let risk = (tcfg.risk_frac as f64 * conv).min(1.0);
+                                    entry_margin = equity * risk;
+                                    let notional = entry_margin * tcfg.leverage as f64;
+                                    pos_size    = (notional / price as f64) as f32;
+                                    entry_price = price;
+                                    entry_time  = tick_now_ns;
+                                    pos_side    = dir;
+                                    best_price  = price;
+                                    let eidx = (order_book.round_trips.write_idx.load(Ordering::Relaxed) as usize) & RT_MASK;
+                                    (*order_book.signal.at_entry.get())[eidx] = s_sig;
+                                    order_book.net_position.fetch_add(dir, Ordering::Relaxed);
+                                    emit_latency_order(buffer, order_book, order_ring,
+                                        current_seq, tick_now_ns, tick_ptr.transit_est_ns);
+                                }
+                            } else {
+                                if pos_side == 1 { if price > best_price { best_price = price; } }
+                                else if price < best_price { best_price = price; }
+                                let move_bps = (price - entry_price) / entry_price * 10_000.0 * pos_side as f32;
+                                let trail_hit = if pos_side == 1 {
+                                    price <= best_price * (1.0 - tcfg.trail_bps / 10_000.0)
+                                } else {
+                                    price >= best_price * (1.0 + tcfg.trail_bps / 10_000.0)
+                                };
+                                let flip = if pos_side == 1 { s_sig < -tcfg.signal_exit_bps }
+                                           else { s_sig > tcfg.signal_exit_bps };
+                                let liq_bps    = 10_000.0 / tcfg.leverage.max(1.0);
+                                let liquidated = move_bps <= -liq_bps;
+                                let tp_hit = tcfg.tp_bps > 0.0 && move_bps >=  tcfg.tp_bps;
+                                let sl_hit = tcfg.sl_bps > 0.0 && move_bps <= -tcfg.sl_bps;
+                                if trail_hit || flip || tp_hit || sl_hit || liquidated {
+                                    let gross_bps  = move_bps as f64;
+                                    let notional   = entry_margin * tcfg.leverage as f64;
+                                    let fees_quote = notional * (2.0 * tcfg.fee_bps as f64 / 10_000.0);
+                                    let raw_pnl    = notional * (gross_bps / 10_000.0) - fees_quote;
+                                    let pnl_quote  = raw_pnl.max(-entry_margin);
+                                    let was_liq    = liquidated || raw_pnl <= -entry_margin;
+                                    equity += pnl_quote;
+                                    if equity <= 0.0 { equity = 0.0; ruined = true;
+                                        halt_trading(order_book, "account ruined (equity ≤ 0)"); }
+                                    let slot = order_book.round_trips.write_idx
+                                        .load(Ordering::Relaxed) as usize & RT_MASK;
+                                    let rt = &mut (*order_book.round_trips.entries.get())[slot];
+                                    rt.entry_time_ns = entry_time;
+                                    rt.exit_time_ns  = tick_now_ns;
+                                    rt.hold_ns       = tick_now_ns.saturating_sub(entry_time);
+                                    rt.side          = pos_side;
+                                    rt.entry_price   = entry_price;
+                                    rt.exit_price    = price;
+                                    rt.size          = pos_size;
+                                    rt.gross_bps     = gross_bps as f32;
+                                    rt.net_bps       = (gross_bps - 2.0 * tcfg.fee_bps as f64) as f32;
+                                    rt.pnl_quote     = pnl_quote as f32;
+                                    rt.fees_quote    = fees_quote as f32;
+                                    rt.flags         = if was_liq { 1.0 } else { 0.0 };
+                                    order_book.round_trips.write_idx.fetch_add(1, Ordering::Release);
+                                    order_book.net_position.fetch_add(-pos_side, Ordering::Relaxed);
+                                    emit_latency_order(buffer, order_book, order_ring,
+                                        current_seq, tick_now_ns, tick_ptr.transit_est_ns);
+                                    pos_side = 0;
+                                }
+                            }
+                        }
+                    }
+
                     // ── Trading model: long & short mean-reversion ──────────────
                     // Enter on a dip/rip vs a rolling EMA reference (optionally
                     // confirmed by order flow); exit on take-profit, stop-loss, the
                     // opposite signal, or LIQUIDATION (adverse move ≥ 1/leverage).
                     // Sizing is capital-based: margin = risk_frac·equity, notional =
                     // margin·leverage, and equity compounds across round-trips.
-                    if tcfg.enabled {
+                    if tcfg.enabled && !tcfg.momentum {
                         if !ref_init { ref_px = price; ref_init = true; }
 
                         // Rolling volatility estimate (bps/tick) and order-flow EMA.

@@ -295,6 +295,22 @@ HFT_TRADE=1 HFT_ADAPTIVE=1 HFT_USE_FLOW=1 HFT_LEVERAGE=50 \
 
 Knobs (all env-overridable): `HFT_ENTRY_BPS`, `HFT_TP_BPS`, `HFT_SL_BPS`, `HFT_FEE_BPS` (per side), `HFT_LEVERAGE`, `HFT_CAPITAL`, `HFT_RISK_FRAC`, `HFT_MAX_SIZE_MULT`, `HFT_USE_FLOW`, `HFT_ADAPTIVE`, `HFT_NO_SHORT`. The JSON log gains a `trading` scorecard (capital, final equity, return %, liquidations, ruined), an `equity_curve`, and a `round_trip_log`. **Fees + leverage are the killers** — a sub-bp gross edge that survives at 1× compounds into a blow-up at 50×. See [`CLAUDE.md`](CLAUDE.md#trading-model-hft_trade).
 
+### Trend-following + cross-market signal
+
+`HFT_MOMENTUM=1` trades **with** the market instead of against it, using a continuous buy/sell signal `S` that blends the traded market's trend + order flow with a **reference market** (basket momentum + lead-lag). It rides the trend but times entries on pullbacks, and exits on signal-flip + trailing stop. The adapter streams two pairs (`--pair` + `--ref-pair`), routed to separate ring buffers via the v3 packet.
+
+```bash
+# Two correlated synthetic markets (reference leads); A/B the two models:
+./target/release/kraken-feed --synth recordings/two.krkr
+HFT_TRADE=1 HFT_MOMENTUM=1 make replay FILE=recordings/two.krkr   # with the trend
+HFT_TRADE=1 HFT_ADAPTIVE=1 make replay FILE=recordings/two.krkr   # against (mean-reversion)
+
+# Live: traded + reference pair
+HFT_TRADE=1 HFT_MOMENTUM=1 make live PAIR=XBT/USD   # set HFT_REF_PAIR=ETH/USD
+```
+
+On a trending tape the difference is stark — going *with* the trend (~59% hit, ~break-even after fees) vs *against* it (~30% hit, deep loss). The JSON exposes `latest_signal_bps`, a `signal_series`, and per-trade `signal_at_entry`. New knobs: `HFT_W_TREND/W_FLOW/W_BASKET/W_LEADLAG`, `HFT_SIGNAL_THR_BPS`, `HFT_PULLBACK_BPS`, `HFT_TRAIL_BPS`, `HFT_REF_PAIR`.
+
 ---
 
 ## What isn't here

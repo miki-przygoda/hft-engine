@@ -433,13 +433,17 @@ The first 16 bytes are byte-identical to the legacy packet (so old senders keep
 working); the extra 16 carry feed metadata:
 
 ```
-[ 0.. 4] price f32      [ 4.. 8] volume f32     [ 8..16] sequence u64
+[ 0.. 4] price f32      [ 4.. 8] volume f32 (signed: buy +, sell −)  [ 8..16] sequence u64
 [16..24] origin_ts_ns   (exchange trade time, ns since epoch — informational)
 [24..32] transit_est_ns (RTT/2 one-way transit estimate — the distance metric)
+[  32  ] instrument u8  (v3 only: 0 = traded, 1 = reference — for cross-market)
 ```
 
 The ingestor parses the extra fields only when it receives ≥ 32 bytes; 16-byte
-packets leave both fields zero.
+packets leave them zero. The **v3 packet (33 bytes)** appends a 1-byte instrument
+id so a second market (the cross-market reference) routes to its own ring buffer;
+< 33-byte packets are instrument 0. `volume` carries *signed* trade volume (buy +,
+sell −) — the order-flow input.
 
 ### Zero dependencies, TLS by proxy
 
@@ -567,12 +571,44 @@ book instead of one-sided buy attempts, and scores its P&L.
   `HFT_SL_BPS`, `HFT_FEE_BPS` (per side), `HFT_LEVERAGE`, `HFT_CAPITAL`,
   `HFT_RISK_FRAC`, `HFT_MAX_SIZE_MULT`, `HFT_USE_FLOW`, `HFT_ADAPTIVE`, `HFT_NO_SHORT`.
 
-`kraken-feed --synth` writes a deterministic **mean-reverting random walk** (OU
-pull + microstructure noise, ~0.7 bps/tick) — a realistic testbed, not the clean
-sine it used to be. On it the model shows a real *gross* edge (~71% win, profit
-factor ~2, ~0.4 bps/trade) that a realistic round-trip fee (`HFT_FEE_BPS`) erases.
-That fee sensitivity — gross edge, net loss — is the honest lesson, and the same
-dynamic you'll see on real data.
+---
+
+## Trend-following + cross-market signal (`HFT_MOMENTUM`)
+
+With `HFT_TRADE=1 HFT_MOMENTUM=1` the strategy trades **with the trend** using a
+continuous buy/sell signal that blends the traded market and one **reference
+market** (slot 1), instead of fading dislocations. This exists because the data
+said so: on a trending tape, mean-reversion (fading) gets destroyed while
+momentum (riding) roughly breaks even.
+
+- **Composite signal** `S` (bps), recomputed every tick and exposed via
+  `OrderBook.latest_signal_bits`:
+  `S = w_trend·own_trend + w_flow·flow + w_basket·ref_trend + w_leadlag·ref_return`.
+  `own_trend`/`ref_trend` = `(fastEMA−slowEMA)/slowEMA` (α 1/16 vs 1/128); `flow`
+  is the normalized order-flow EMA; `ref_return` is the reference's recent return
+  (it **leads**). The reference is sampled read-only across its own cursor.
+- **Entry — trend + pullback:** when `S > +thr` (bullish) buy a short-term dip
+  below the fast EMA by `pullback_bps`; when `S < −thr` (bearish) short a rip.
+  Size scales with `|S|` conviction. Capital/leverage/liquidation as in HFT_TRADE.
+- **Exit — signal-flip + trailing:** exit when `S` flips, or a trailing stop
+  retraces `trail_bps` from the best price since entry; TP/SL/liquidation are caps.
+- **Two instruments:** the adapter subscribes to `--pair` (id 0) + `--ref-pair`
+  (id 1); the ingestor routes by the v3 packet's instrument byte to two ring
+  buffers; the strategy spins on slot 0 and read-snapshots slot 1. The
+  order-ring/exchange/trade-log stay tied to slot 0.
+- **Signal as a first-class output:** the JSON `trading` block adds the weights +
+  `latest_signal_bps`, a downsampled `signal_series`, and per-trade
+  `signal_at_entry` — so the buy/sell call is inspectable at any point.
+- **Config:** `HFT_MOMENTUM`, `HFT_W_TREND/W_FLOW/W_BASKET/W_LEADLAG`,
+  `HFT_SIGNAL_THR_BPS`, `HFT_PULLBACK_BPS`, `HFT_TRAIL_BPS`, `HFT_SIGNAL_EXIT_BPS`,
+  `HFT_BETA`, and `--ref-pair` / `HFT_REF_PAIR` (adapter).
+
+`kraken-feed --synth` writes **two correlated markets** (a shared trending latent
+factor; the reference leads the traded market by a lag) so the basket and lead-lag
+terms have genuine predictive value offline. The mean-reversion default (`HFT_TRADE`
+without `HFT_MOMENTUM`) still trades a single-market OU walk; flipping `HFT_MOMENTUM`
+on the same capture is the honest A/B (momentum ~58% hit / ~break-even vs
+mean-reversion ~30% hit / deep loss on a trend).
 
 ---
 
@@ -704,9 +740,10 @@ a quick test.
     round-trip log is pre-touched with the same step-8 loop).
 11. **Do not replace `Instant::elapsed()` with `mach_absolute_time()` FFI.**
     Empirically ~42× slower and unit-fragile.
-12. **The v2 market-data packet is 32 bytes.** The first 16 bytes stay
-    byte-identical to the legacy packet; the ingestor parses `origin_ts_ns` /
-    `transit_est_ns` only when `amt >= 32`, so 16-byte senders remain valid.
+12. **Market-data packets are versioned and back-compatible.** Legacy = 16 bytes,
+    v2 = 32 (adds `origin_ts_ns`/`transit_est_ns`), v3 = 33 (adds a 1-byte
+    `instrument` id at [32]). The ingestor parses each tier by `amt`; old senders
+    stay valid and route to instrument 0.
 13. **stunnel terminates TLS externally; `kraken-feed` is plaintext TCP.** The
     adapter speaks WebSocket by hand and never links a TLS library — this is what
     keeps the workspace zero-dependency while consuming a `wss://` feed.

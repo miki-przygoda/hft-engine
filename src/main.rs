@@ -24,6 +24,7 @@ pub(crate) const BUFFER_SIZE:        usize = 1024;
 pub(crate) const TRADE_LOG_SIZE:     usize = 1024;
 pub(crate) const ORDER_RING_SIZE:    usize = 1024;
 pub(crate) const ROUND_TRIP_LOG_SIZE: usize = 4096;
+pub(crate) const SIGNAL_SERIES_LEN:  usize = 2048;  // downsampled composite-signal ring
 
 /// Parse an env var as an f32, falling back to `default` when unset/invalid.
 fn env_f32(key: &str, default: f32) -> f32 {
@@ -63,9 +64,26 @@ fn main() {
         use_flow:      std::env::var_os("HFT_USE_FLOW").is_some(),
         capital:       env_f32("HFT_CAPITAL",   rust_hft_software::config::CAPITAL_DEFAULT),
         risk_frac:     env_f32("HFT_RISK_FRAC", rust_hft_software::config::RISK_FRAC_DEFAULT),
+        momentum:      std::env::var_os("HFT_MOMENTUM").is_some(),
+        w_trend:        env_f32("HFT_W_TREND",   rust_hft_software::config::W_TREND_DEFAULT),
+        w_flow:         env_f32("HFT_W_FLOW",    rust_hft_software::config::W_FLOW_DEFAULT),
+        w_basket:       env_f32("HFT_W_BASKET",  rust_hft_software::config::W_BASKET_DEFAULT),
+        w_leadlag:      env_f32("HFT_W_LEADLAG", rust_hft_software::config::W_LEADLAG_DEFAULT),
+        signal_thr_bps: env_f32("HFT_SIGNAL_THR_BPS", rust_hft_software::config::SIGNAL_THR_BPS_DEFAULT),
+        pullback_bps:   env_f32("HFT_PULLBACK_BPS",   rust_hft_software::config::PULLBACK_BPS_DEFAULT),
+        trail_bps:      env_f32("HFT_TRAIL_BPS",      rust_hft_software::config::TRAIL_BPS_DEFAULT),
+        signal_exit_bps: env_f32("HFT_SIGNAL_EXIT_BPS", rust_hft_software::config::SIGNAL_EXIT_BPS_DEFAULT),
+        beta:           env_f32("HFT_BETA",      rust_hft_software::config::BETA_DEFAULT),
     };
 
-    if trade_cfg.enabled {
+    if trade_cfg.enabled && trade_cfg.momentum {
+        println!("[engine] TRADING model: {} TREND-FOLLOWING + cross-market signal  fee {:.1}bps/side  {:.0}x lev",
+            if trade_cfg.allow_short { "long&short" } else { "long-only" },
+            trade_cfg.fee_bps, trade_cfg.leverage);
+        println!("[engine] S = {:.1}·own_trend + {:.1}·flow + {:.1}·basket + {:.1}·leadlag   gate {:.1}bps  pullback {:.1}bps  trail {:.1}bps",
+            trade_cfg.w_trend, trade_cfg.w_flow, trade_cfg.w_basket, trade_cfg.w_leadlag,
+            trade_cfg.signal_thr_bps, trade_cfg.pullback_bps, trade_cfg.trail_bps);
+    } else if trade_cfg.enabled {
         let rule = if trade_cfg.adaptive { "ADAPTIVE (1σ/1.5σ/2.5σ)".to_string() }
             else { format!("entry {:.1} / TP {:.1} / SL {:.1} bps",
                 trade_cfg.entry_dip_bps, trade_cfg.tp_bps, trade_cfg.sl_bps) };
@@ -84,11 +102,18 @@ fn main() {
         println!("[engine] target-price mode: buy when price ≤ {target_price}");
     }
 
-    let buffer = Arc::new(models::RingBuffer {
+    // Two ring buffers sharing one clock origin: slot 0 = the traded instrument
+    // (drives the hot path, order ring, exchange, trade log), slot 1 = the
+    // cross-market reference (read-only by the strategy for the basket/lead-lag
+    // signal). The dormant InstrumentBuffers scaffold generalizes this to N.
+    let start = Instant::now();
+    let mk_buffer = || models::RingBuffer {
         ticks:      unsafe { std::mem::zeroed() },
         latest_idx: AtomicU64::new(0),
-        start_time: Instant::now(),
-    });
+        start_time: start,
+    };
+    let traded    = Arc::new(mk_buffer());
+    let reference = Arc::new(mk_buffer());
 
     let order_book = Arc::new(models::OrderBook {
         trade_log:     models::TradeLog::new(),
@@ -112,6 +137,8 @@ fn main() {
         trade_cfg,
         round_trips:   models::RoundTripLog::new(),
         vol_ema_bits:  AtomicU32::new(0),
+        latest_signal_bits: AtomicU32::new(0),
+        signal:        models::SignalLog::new(),
     });
 
     let order_ring = Arc::new(models::OrderRing::new());
@@ -122,9 +149,11 @@ fn main() {
     // during trading. Each struct is one cache line (64 bytes), so one write
     // per entry covers both page commitment and cache-line warming.
     unsafe {
-        let ticks = buffer.ticks.as_ptr() as *mut u64;
-        for i in (0..BUFFER_SIZE * 8).step_by(8) {
-            std::ptr::write_volatile(ticks.add(i), 0);
+        for buf in [&traded, &reference] {
+            let ticks = buf.ticks.as_ptr() as *mut u64;
+            for i in (0..BUFFER_SIZE * 8).step_by(8) {
+                std::ptr::write_volatile(ticks.add(i), 0);
+            }
         }
         let ring = (*order_ring.entries.get()).as_ptr() as *mut u64;
         for i in (0..ORDER_RING_SIZE * 8).step_by(8) {
@@ -150,14 +179,14 @@ fn main() {
 
     thread::spawn({
         let ob  = Arc::clone(&order_book);
-        let buf = Arc::clone(&buffer);
+        let buf = Arc::clone(&traded);
         let lpn = Arc::clone(&last_packet_ns);
         move || engine::run_watchdog(ob, buf, lpn)
     });
 
     thread::spawn({
         let ring = Arc::clone(&order_ring);
-        let buf  = Arc::clone(&buffer);
+        let buf  = Arc::clone(&traded);
         let ob   = Arc::clone(&order_book);
         let rdy  = Arc::clone(&exchange_ready);
         move || {
@@ -168,14 +197,15 @@ fn main() {
     });
 
     thread::spawn({
-        let buf = Arc::clone(&buffer);
+        let buf = Arc::clone(&traded);
+        let rbuf = Arc::clone(&reference);
         let ob  = Arc::clone(&order_book);
         let lpn = Arc::clone(&last_packet_ns);
         let rdy = Arc::clone(&ingestor_ready);
         move || {
             engine::set_qos_interactive();
             engine::set_thread_affinity_tag(2); // ingestor → core 3
-            engine::run_ingestor(buf, ob, lpn, rdy);
+            engine::run_ingestor(buf, rbuf, ob, lpn, rdy);
         }
     });
 
@@ -193,7 +223,8 @@ fn main() {
     }
 
     let strategy = thread::spawn({
-        let buf  = Arc::clone(&buffer);
+        let buf  = Arc::clone(&traded);
+        let rbuf = Arc::clone(&reference);
         let ob   = Arc::clone(&order_book);
         let ring = Arc::clone(&order_ring);
         let ir   = Arc::clone(&ingestor_ready);
@@ -207,7 +238,7 @@ fn main() {
             // Affinity tag 1: hint the scheduler to keep the strategy thread on
             // the same P-core cluster throughout the session (item 6).
             engine::set_thread_affinity_tag(1);
-            unsafe { engine::trading_strategy(&buf, &ob, &ring); }
+            unsafe { engine::trading_strategy(&buf, &rbuf, &ob, &ring); }
         }
     });
 

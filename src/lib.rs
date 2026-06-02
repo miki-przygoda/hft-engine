@@ -51,6 +51,12 @@ pub mod config {
     // The ingestor parses the extra fields only when it receives >= 32 bytes.
     pub const INGEST_PACKET_SIZE_V2: usize = 32;
 
+    // v3 packet appends a 1-byte instrument id at [32] so a second market (the
+    // cross-market reference) can be routed to its own ring buffer.
+    // Back-compat: amt<32 legacy, 32<=amt<33 v2 (id 0), amt>=33 reads pkt[32].
+    pub const INGEST_PACKET_SIZE_V3: usize = 33;
+    pub const N_INSTRUMENTS: usize = 2;  // traded (0) + reference (1); scaffold allows MAX_INSTRUMENTS
+
     // Kraken WebSocket v1 feed. TLS is terminated by a local stunnel instance
     // (STUNNEL_ADDR → KRAKEN_HOST:443); the adapter speaks plaintext TCP to
     // stunnel and never links a TLS library (zero-dependency invariant #13).
@@ -83,4 +89,19 @@ pub mod config {
     pub const MAX_SIZE_MULT_DEFAULT: f32 = 4.0;   // cap on dynamic size scaling
     pub const CAPITAL_DEFAULT:       f32 = 10_000.0; // starting capital (quote)
     pub const RISK_FRAC_DEFAULT:     f32 = 0.10;  // margin per trade as a fraction of equity
+
+    // ── Trend-following + cross-market signal (HFT_MOMENTUM) ─────────────────
+    // A composite buy/sell signal S blends own trend + own order flow + a
+    // reference market's trend (basket) + the reference's lead-lag. Trade WITH
+    // the trend, time entries on pullbacks, exit on signal-flip / trailing stop.
+    pub const KRAKEN_REF_PAIR:    &str = "ETH/USD";  // cross-market reference (adapter)
+    pub const W_TREND_DEFAULT:    f32 = 1.0;   // weight: own fast-vs-slow EMA trend (bps)
+    pub const W_FLOW_DEFAULT:     f32 = 0.5;   // weight: own order-flow (normalized)
+    pub const W_BASKET_DEFAULT:   f32 = 0.5;   // weight: reference trend (market beta)
+    pub const W_LEADLAG_DEFAULT:  f32 = 0.5;   // weight: reference recent return (leads us)
+    pub const SIGNAL_THR_BPS_DEFAULT:  f32 = 5.0;  // |S| gate to call a trend
+    pub const PULLBACK_BPS_DEFAULT:    f32 = 2.0;  // dip/rip vs fast EMA to time entry
+    pub const TRAIL_BPS_DEFAULT:       f32 = 8.0;  // trailing-stop retrace from best price
+    pub const SIGNAL_EXIT_BPS_DEFAULT: f32 = 0.0;  // exit when S weakens past this (0 = pure flip)
+    pub const BETA_DEFAULT:            f32 = 1.0;  // lead-lag transfer coefficient
 }

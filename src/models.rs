@@ -12,7 +12,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::{BUFFER_SIZE, ORDER_RING_SIZE, ROUND_TRIP_LOG_SIZE, TRADE_LOG_SIZE};
+use crate::{BUFFER_SIZE, ORDER_RING_SIZE, ROUND_TRIP_LOG_SIZE, SIGNAL_SERIES_LEN, TRADE_LOG_SIZE};
 use rust_hft_software::config::MAX_INSTRUMENTS;
 
 /// A single market data tick — exactly one 64-byte cache line.
@@ -170,6 +170,17 @@ pub(crate) struct TradeCfg {
     pub use_flow:      bool,  // require order-flow (signed-volume) confirmation
     pub capital:       f32,   // starting capital (quote); equity compounds from here
     pub risk_frac:     f32,   // fraction of equity used as margin per trade
+    // ── Trend-following + cross-market signal (HFT_MOMENTUM) ──
+    pub momentum:        bool, // gate: trade WITH the trend (else mean-reversion)
+    pub w_trend:         f32,  // composite-S weights
+    pub w_flow:          f32,
+    pub w_basket:        f32,
+    pub w_leadlag:       f32,
+    pub signal_thr_bps:  f32,  // |S| gate to call a trend
+    pub pullback_bps:    f32,  // dip/rip vs fast EMA to time entry
+    pub trail_bps:       f32,  // trailing-stop retrace
+    pub signal_exit_bps: f32,  // exit when S weakens past this
+    pub beta:            f32,  // lead-lag transfer coefficient
 }
 
 /// One completed round-trip (entry → exit), the unit of the P&L scorecard.
@@ -247,6 +258,30 @@ pub(crate) struct OrderBook {
     pub(crate) trade_cfg:   TradeCfg,        // set once by main
     pub(crate) round_trips: RoundTripLog,    // completed round-trips; sole writer: strategy
     pub(crate) vol_ema_bits: AtomicU32,      // final rolling volatility est (f32 bps bits); writer: strategy
+    // ── Composite signal output (HFT_MOMENTUM) ──
+    pub(crate) latest_signal_bits: AtomicU32,// latest S (f32 bps bits), written every tick by strategy
+    pub(crate) signal:      SignalLog,       // downsampled S series + per-trade S; sole writer: strategy
+}
+
+/// Signal output log (single writer: strategy). `series` is a downsampled ring of
+/// the composite signal S; `at_entry[k]` is S at the entry of round-trip k. Both
+/// are read only at shutdown. Mirrors the lock-free single-writer pattern of TradeLog.
+pub(crate) struct SignalLog {
+    pub(crate) series:     UnsafeCell<[f32; SIGNAL_SERIES_LEN]>,
+    pub(crate) series_idx: AtomicU64,
+    pub(crate) at_entry:   UnsafeCell<[f32; ROUND_TRIP_LOG_SIZE]>,
+}
+
+unsafe impl Sync for SignalLog {}
+
+impl SignalLog {
+    pub(crate) fn new() -> Self {
+        SignalLog {
+            series:     UnsafeCell::new([0.0; SIGNAL_SERIES_LEN]),
+            series_idx: AtomicU64::new(0),
+            at_entry:   UnsafeCell::new([0.0; ROUND_TRIP_LOG_SIZE]),
+        }
+    }
 }
 
 // ── Multi-instrument scaffold (item 8) ──────────────────────────────────────

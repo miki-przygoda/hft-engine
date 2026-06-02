@@ -39,7 +39,7 @@ use std::net::{TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 use rust_hft_software::config::{
-    INGESTOR_ADDR, KRAKEN_HOST, KRAKEN_PAIR, RECORD_PATH_DEFAULT,
+    INGESTOR_ADDR, KRAKEN_HOST, KRAKEN_PAIR, KRAKEN_REF_PAIR, RECORD_PATH_DEFAULT,
     RTT_PING_INTERVAL_MS, STUNNEL_ADDR,
 };
 
@@ -49,14 +49,16 @@ const RECORD_VERSION: u8 = 1;
 
 // ── Packet ──────────────────────────────────────────────────────────────────
 
-/// Build the engine's 32-byte v2 market-data packet (little-endian).
-fn build_packet(price: f32, volume: f32, seq: u64, origin_ts_ns: u64, transit_est_ns: u64) -> [u8; 32] {
-    let mut p = [0u8; 32];
+/// Build the engine's 33-byte v3 market-data packet (little-endian): the 32-byte
+/// v2 layout plus a 1-byte instrument id at [32] (0 = traded, 1 = reference).
+fn build_packet(price: f32, volume: f32, seq: u64, origin_ts_ns: u64, transit_est_ns: u64, instrument: u8) -> [u8; 33] {
+    let mut p = [0u8; 33];
     p[0..4].copy_from_slice(&price.to_le_bytes());
     p[4..8].copy_from_slice(&volume.to_le_bytes());
     p[8..16].copy_from_slice(&seq.to_le_bytes());
     p[16..24].copy_from_slice(&origin_ts_ns.to_le_bytes());
     p[24..32].copy_from_slice(&transit_est_ns.to_le_bytes());
+    p[32] = instrument;
     p
 }
 
@@ -219,6 +221,13 @@ fn parse_trades(msg: &str) -> Vec<(f32, f32, u64)> {
     out
 }
 
+/// Extract the trading pair from a Kraken v1 trade frame's tail
+/// (`...,"trade","XBT/USD"]` → `XBT/USD`). `None` for non-trade frames.
+fn frame_pair(msg: &str) -> Option<String> {
+    let i = msg.rfind("\"trade\"")?;
+    quoted_tokens(&msg[i + 7..]).into_iter().next()
+}
+
 /// Collect the contents of double-quoted strings, in order.
 fn quoted_tokens(s: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -372,26 +381,45 @@ fn run_synth(path: &str) -> io::Result<()> {
         ((seed >> 16) as f64 / (1u64 << 48) as f64) * 2.0 - 1.0
     };
 
-    let mut price: f64 = 60_000.0;
-    let mut center: f64 = 60_000.0;
-    for seq in 1..=n {
-        center += 1.5 * u();                       // slow random drift of fair value
-        let reversion = (center - price) * 0.05;   // OU pull back toward center
-        let shock = (u() + u() + u()) / 3.0 * 14.0; // ~approx-normal noise, ~2 bps of 60k
-        price += reversion + shock;
+    // Two correlated markets driven by a shared latent factor F (a trending random
+    // walk, in bps). The REFERENCE (id 1, ~ETH scale) reacts to F now; the TRADED
+    // market (id 0, ~BTC scale) reacts to F delayed by LAG ticks — so the reference
+    // LEADS, giving the cross-market trend (basket) and lead-lag terms genuine
+    // predictive value. Each market also gets idiosyncratic noise and flow ~ its
+    // own recent move. Deterministic (seeded LCG).
+    const LAG: usize = 5;
+    let traded_base = 60_000.0_f64;
+    let ref_base    = 3_000.0_f64;
+    let mut f: f64 = 0.0;          // latent factor, cumulative bps
+    let mut trend: f64 = 0.0;      // slowly meandering drift of F (bps/tick)
+    let mut f_hist = [0.0f64; LAG + 1];
+    let mut traded_prev = traded_base;
+    let mut ref_prev = ref_base;
 
-        // Signed order flow: net buying when price is below fair value (about to
-        // revert up), plus noise — so flow is a *noisy* leading signal, not magic.
-        let signed_vol = ((center - price) * 0.02 + 1.2 * u()) as f32;
+    for seq in 1..=n {
+        trend = (trend + 0.03 * u()).clamp(-2.5, 2.5);
+        f += trend + 5.0 * u();
+        for k in (1..=LAG).rev() { f_hist[k] = f_hist[k - 1]; }
+        f_hist[0] = f;
+
+        let ref_price    = ref_base    * (1.0 + f / 10_000.0)          + 0.6 * u();
+        let traded_price = traded_base * (1.0 + f_hist[LAG] / 10_000.0) + 8.0 * u();
+        let ref_vol    = ((ref_price - ref_prev)    * 0.5  + 0.3 * u()) as f32;
+        let traded_vol = ((traded_price - traded_prev) * 0.02 + 1.0 * u()) as f32;
+        ref_prev = ref_price;
+        traded_prev = traded_price;
 
         let transit = 33_000_000 + (seq.wrapping_mul(2_654_435) % 8_000_000);
         let origin = 1_700_000_000_000_000_000u64.wrapping_add(seq.wrapping_mul(5_000_000));
-        let pkt = build_packet(price as f32, signed_vol, seq, origin, transit);
-        rec.file.write_all(&5_000_000u64.to_le_bytes())?; // 5 ms apart
-        rec.file.write_all(&(pkt.len() as u16).to_le_bytes())?;
-        rec.file.write_all(&pkt)?;
+        // Emit reference (id 1) then traded (id 0), 2.5 ms apart (≈5 ms/round).
+        for (price, vol, id) in [(ref_price, ref_vol, 1u8), (traded_price, traded_vol, 0u8)] {
+            let pkt = build_packet(price as f32, vol, seq, origin, transit, id);
+            rec.file.write_all(&2_500_000u64.to_le_bytes())?;
+            rec.file.write_all(&(pkt.len() as u16).to_le_bytes())?;
+            rec.file.write_all(&pkt)?;
+        }
     }
-    println!("[kraken-feed] wrote {n} synthetic packets (mean-reverting random walk) to {path}");
+    println!("[kraken-feed] wrote {n}×2 synthetic packets (two correlated markets, reference leads) to {path}");
     Ok(())
 }
 
@@ -412,6 +440,7 @@ fn sleep_ns(ns: u64) {
 fn run_live(
     endpoint: &str,
     pair: &str,
+    ref_pair: &str,
     ingestor: &str,
     record: Option<&str>,
 ) -> io::Result<()> {
@@ -419,7 +448,7 @@ fn run_live(
     let mut stream = TcpStream::connect(endpoint)?;
     stream.set_nodelay(true).ok();
     let mut acc = ws_handshake(&mut stream, KRAKEN_HOST)?;
-    println!("[kraken-feed] websocket connected; subscribing to {pair} trades");
+    println!("[kraken-feed] websocket connected; subscribing to {pair} (0) + {ref_pair} (1) trades");
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
 
     let udp = UdpSocket::bind("0.0.0.0:0")?;
@@ -429,12 +458,12 @@ fn run_live(
     };
 
     let sub = format!(
-        "{{\"event\":\"subscribe\",\"pair\":[\"{pair}\"],\"subscription\":{{\"name\":\"trade\"}}}}"
+        "{{\"event\":\"subscribe\",\"pair\":[\"{pair}\",\"{ref_pair}\"],\"subscription\":{{\"name\":\"trade\"}}}}"
     );
     stream.write_all(&build_frame(0x1, sub.as_bytes()))?;
 
     let start = Instant::now();
-    let mut seq: u64 = 1;
+    let mut seq: [u64; 2] = [1, 1];   // per-instrument sequence
     let mut transit_est: u64 = 0;
     // Send an initial ping so we get an RTT sample quickly.
     stream.write_all(&build_frame(0x9, &start.elapsed().as_nanos().to_le_bytes()[..8]))?;
@@ -448,11 +477,18 @@ fn run_live(
             match opcode {
                 0x1 => {
                     let msg = String::from_utf8_lossy(&payload);
+                    // Map the frame's pair to an instrument id (0 traded, 1 reference).
+                    let id: u8 = match frame_pair(&msg) {
+                        Some(p) if p == pair     => 0,
+                        Some(p) if p == ref_pair => 1,
+                        _ => continue,   // unknown pair / non-trade frame
+                    };
                     for (price, signed_vol, origin_ts_ns) in parse_trades(&msg) {
-                        let pkt = build_packet(price, signed_vol, seq, origin_ts_ns, transit_est);
+                        let s = seq[id as usize];
+                        let pkt = build_packet(price, signed_vol, s, origin_ts_ns, transit_est, id);
                         udp.send_to(&pkt, ingestor)?;
                         if let Some(r) = recorder.as_mut() { r.write(&pkt)?; }
-                        seq += 1;
+                        seq[id as usize] = s + 1;
                     }
                 }
                 0x9 => { stream.write_all(&build_frame(0xA, &payload))?; } // ping → pong
@@ -489,6 +525,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut endpoint = STUNNEL_ADDR.to_string();
     let mut pair = KRAKEN_PAIR.to_string();
+    let mut ref_pair = std::env::var("HFT_REF_PAIR").unwrap_or_else(|_| KRAKEN_REF_PAIR.to_string());
     let mut ingestor = INGESTOR_ADDR.to_string();
     let mut record: Option<String> = None;
     let mut replay: Option<String> = None;
@@ -499,6 +536,7 @@ fn main() {
         match args[i].as_str() {
             "--live"     => { if let Some(v) = args.get(i + 1).filter(|v| !v.starts_with("--")) { endpoint = v.clone(); i += 1; } }
             "--pair"     => { if let Some(v) = args.get(i + 1) { pair = v.clone(); i += 1; } }
+            "--ref-pair" => { if let Some(v) = args.get(i + 1) { ref_pair = v.clone(); i += 1; } }
             "--ingestor" => { if let Some(v) = args.get(i + 1) { ingestor = v.clone(); i += 1; } }
             "--record"   => { record = Some(args.get(i + 1).cloned().unwrap_or_else(|| RECORD_PATH_DEFAULT.to_string())); if record.as_deref().map(|s| !s.starts_with("--")).unwrap_or(false) { i += 1; } }
             "--replay"   => { replay = Some(args.get(i + 1).cloned().unwrap_or_else(|| RECORD_PATH_DEFAULT.to_string())); i += 1; }
@@ -514,7 +552,7 @@ fn main() {
     } else if let Some(path) = replay {
         run_replay(&path, &ingestor)
     } else {
-        run_live(&endpoint, &pair, &ingestor, record.as_deref())
+        run_live(&endpoint, &pair, &ref_pair, &ingestor, record.as_deref())
     };
 
     if let Err(e) = result {
