@@ -347,6 +347,12 @@ HFT_EXTERNAL_FEED=1 HFT_TRADE=1 HFT_MOMENTUM=1 HFT_MODEL=models/policy.bin \
 ./target/release/kraken-feed --replay recordings/two.krkr
 ```
 
+To **score a trained policy** over a long capture instantly (offline, no real-time replay), run `--backtest` *with* `HFT_MODEL` set — it plays the learned policy over the whole capture and prints a scorecard (with a first-half/second-half stability split). Train on one capture, evaluate on different (unseen-seed) captures for a true cross-session out-of-sample read:
+
+```bash
+HFT_TRADE=1 HFT_MODEL=models/policy.bin ./target/release/trading-engine --backtest recordings/other-day.krkr
+```
+
 Knobs (defaults in `config`): `HFT_MODEL` (weights path), `HFT_POP` / `HFT_GEN` (CEM population / generations), `HFT_SEED`. Unset `HFT_MODEL` and the engine uses the hand-weighted signal — the learned path is purely additive. **Honesty:** CEM on a short capture overfits readily; the trade-count penalty and OOS report make that visible. Train on a long real capture and trust the out-of-sample column.
 
 ---

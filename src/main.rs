@@ -108,15 +108,11 @@ fn main() {
         println!("[engine] target-price mode: buy when price ≤ {target_price}");
     }
 
-    // Backtest / parameter-sweep mode: run the model over a recorded capture
-    // offline (in-sample/out-of-sample split) and exit — no threads or sockets.
     let args: Vec<String> = std::env::args().collect();
-    if let Some(i) = args.iter().position(|a| a == "--backtest") {
-        let path = args.get(i + 1).cloned().unwrap_or_else(|| "recordings/two.krkr".to_string());
-        engine::run_backtest(&path, trade_cfg);
-        return;
-    }
-    // Train a learned policy (CEM) over a capture and write it to HFT_MODEL.
+
+    // Train a learned policy (CEM) over a capture and write it to HFT_MODEL, then
+    // exit — no threads or sockets. (Checked before loading, since HFT_MODEL is
+    // the OUTPUT path here and need not exist yet.)
     if let Some(i) = args.iter().position(|a| a == "--train") {
         let path = args.get(i + 1).cloned().unwrap_or_else(|| "recordings/two.krkr".to_string());
         engine::run_train(&path, trade_cfg);
@@ -134,6 +130,18 @@ fn main() {
             Err(e) => { eprintln!("[model] could not read {path}: {e}; using hand-weighted signal"); None }
         }
     });
+
+    // Backtest mode: run the model over a recorded capture offline and exit. With a
+    // learned policy loaded (HFT_MODEL) → evaluate THAT policy over the whole
+    // capture (run_eval); otherwise sweep the hand-weighted config grid.
+    if let Some(i) = args.iter().position(|a| a == "--backtest") {
+        let path = args.get(i + 1).cloned().unwrap_or_else(|| "recordings/two.krkr".to_string());
+        match policy {
+            Some(p) => engine::run_eval(&path, trade_cfg, p),
+            None    => engine::run_backtest(&path, trade_cfg),
+        }
+        return;
+    }
 
     // Two ring buffers sharing one clock origin: slot 0 = the traded instrument
     // (drives the hot path, order ring, exchange, trade log), slot 1 = the

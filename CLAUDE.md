@@ -693,6 +693,16 @@ HFT_EXTERNAL_FEED=1 HFT_TRADE=1 HFT_MOMENTUM=1 HFT_MODEL=models/policy.bin \
 # or: make train         (synth + train)
 ```
 
+### Evaluating a trained policy — `--backtest` with `HFT_MODEL`
+`--replay` re-emits at the recorded inter-arrival cadence, so a multi-day capture
+takes *hours* of wall-time. To score a trained policy over a long capture
+**instantly and offline**, run `--backtest <capture>` *with* `HFT_MODEL` set: the
+engine plays the learned policy over the whole capture at full speed and prints a
+scorecard (plus a first-half/second-half split to show the edge is stable, not
+front-loaded). Train on one capture, evaluate on *different* (unseen-seed)
+captures for a true cross-session out-of-sample read. Without `HFT_MODEL`,
+`--backtest` falls back to the hand-weighted config sweep.
+
 **Config** (env-overridable; defaults in `config`): `HFT_MODEL` (weights path —
 load at startup, write target for `--train`), `HFT_POP` (population, 256),
 `HFT_GEN` (generations, 40), `HFT_SEED` (RNG seed). If `HFT_MODEL` is unset the

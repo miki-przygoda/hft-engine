@@ -544,6 +544,7 @@ fn summarize_slippage(v: Vec<f64>) -> Option<SlipStat> {
 }
 
 // P&L scorecard computed from the completed round-trips at shutdown.
+#[derive(Clone, Copy)]
 struct Scorecard {
     n: usize, wins: usize, losses: usize, longs: usize, shorts: usize, liquidations: usize,
     gross_wins: usize, hit_rate: f64,
@@ -719,6 +720,60 @@ pub(crate) fn run_backtest(path: &str, base: models::TradeCfg) {
         println!("Best out-of-sample return: {:+.2}%  ({} configs; ranked by OOS, not in-sample)", oosr, rows.len());
     }
     println!("(maker fee = HFT_MAKER_BPS={:.1}; set HFT_NORMALIZE=1 to sweep the z-scored signal)", base.maker_bps);
+}
+
+// ── Evaluate a single (learned) policy over a whole capture, offline ─────────
+// When HFT_MODEL is set, `--backtest` runs THIS instead of the hand-weighted grid
+// sweep: it plays the trained policy over the entire capture at full speed (no
+// sleeps), prints the full scorecard, and splits the capture into halves to show
+// whether the edge is stable across the session (not just front-loaded). Point it
+// at a capture the policy was NOT trained on for a true out-of-sample read.
+pub(crate) fn run_eval(path: &str, base: models::TradeCfg, policy: crate::model::Policy) {
+    let ticks = match load_capture(path) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("[eval] {e}"); return; }
+    };
+    let traded_n = ticks.iter().filter(|t| t.id == 0).count();
+    let mut cfg = base;
+    cfg.enabled = true;
+    cfg.momentum = true;
+    let cap = cfg.capital as f64;
+
+    println!("[eval] learned policy over {} ticks ({} traded) from {}", ticks.len(), traded_n, path);
+    println!("       capital {:.0}, fee {:.1} bps/side, {:.0}x lev  (this capture is held out — train was on a different one)",
+             cfg.capital, cfg.fee_bps, cfg.leverage);
+    println!("{}", "─".repeat(78));
+
+    let rts = run_model(&ticks, cfg, Some(policy));
+
+    // Per-half stability: bucket round-trips by entry time into the first/second
+    // half of the capture's time span.
+    let t_lo = ticks.first().map(|t| t.t_ns).unwrap_or(0);
+    let t_hi = ticks.last().map(|t| t.t_ns).unwrap_or(0);
+    let t_mid = t_lo + (t_hi - t_lo) / 2;
+    let h1: Vec<models::RoundTrip> = rts.iter().copied().filter(|r| r.entry_time_ns <  t_mid).collect();
+    let h2: Vec<models::RoundTrip> = rts.iter().copied().filter(|r| r.entry_time_ns >= t_mid).collect();
+    let line = |tag: &str, s: &Option<Scorecard>| match s {
+        Some(sc) => println!("{:<11} n={:<4} hit={:>5.1}%  win={:>5.1}%  ret={:>+7.2}%  netP&L={:>+9.2}  PF={:>5.2}  Sharpe={:>5.2}  maxDD={:>4.1}%",
+                             tag, sc.n, sc.hit_rate, sc.win_rate, sc.return_pct, sc.total_pnl, sc.profit_factor, sc.sharpe, sc.max_dd_pct),
+        None => println!("{tag:<11} no round-trips"),
+    };
+    line("first-half",  &scorecard(&h1,  cap));
+    line("second-half", &scorecard(&h2,  cap));
+    println!("{}", "─".repeat(78));
+    match scorecard(&rts, cap) {
+        Some(s) => {
+            line("FULL", &Some(s));
+            println!("  {} long / {} short  |  liquidations {}  |  avg win {:+.2} / avg loss {:+.2} bps  |  avg hold {:.1} ms",
+                     s.longs, s.shorts, s.liquidations, s.avg_win_bps, s.avg_loss_bps, s.avg_hold_ms);
+            println!("  net {:+.2} bps/trade after fees  |  gross {:+.2} bps/trade  |  total fees {:.2}",
+                     s.net_bps_mean, s.gross_bps_mean, s.total_fees);
+            let verdict = if s.ruined { "BLOWN UP (ruined)" }
+                          else if s.return_pct > 0.0 { "net PROFITABLE" } else { "net LOSS" };
+            println!("→ {verdict} after fees over this held-out capture.");
+        }
+        None => println!("FULL        no round-trips (the policy never fired on this capture)."),
+    }
 }
 
 // ── Train a learned policy by cross-entropy method (CEM) ─────────────────────
