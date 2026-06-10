@@ -39,8 +39,9 @@ use std::net::{TcpStream, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rust_hft_software::config::{
-    API_STUNNEL_ADDR, INGESTOR_ADDR, KRAKEN_API_HOST, KRAKEN_HOST, KRAKEN_PAIR,
-    KRAKEN_REF_PAIR, RECORD_PATH_DEFAULT, RTT_PING_INTERVAL_MS, STUNNEL_ADDR,
+    API_STUNNEL_ADDR, FUTURES_STUNNEL_ADDR, INGESTOR_ADDR, KRAKEN_API_HOST, KRAKEN_FUTURES_HOST,
+    KRAKEN_FUTURES_PRODUCT, KRAKEN_HOST, KRAKEN_PAIR, KRAKEN_REF_PAIR, RECORD_PATH_DEFAULT,
+    RTT_PING_INTERVAL_MS, STUNNEL_ADDR,
 };
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -685,6 +686,91 @@ fn run_live(
     }
 }
 
+/// Stream the Kraken **Futures** public `ticker` feed (bid/ask/mark/funding) for
+/// `product` and emit v4 packets. Public feed → no auth (challenge/sign is only
+/// for private order feeds). Mirrors `run_live` but parses the futures ticker and
+/// sets the packet price to the mid.
+fn run_futures(
+    endpoint: &str,
+    product: &str,
+    ingestor: &str,
+    record: Option<&str>,
+) -> io::Result<()> {
+    println!("[kraken-feed] connecting to {endpoint} (stunnel → {KRAKEN_FUTURES_HOST}:443)");
+    let mut stream = TcpStream::connect(endpoint)?;
+    stream.set_nodelay(true).ok();
+    let mut acc = ws_handshake(&mut stream, KRAKEN_FUTURES_HOST)?;
+    println!("[kraken-feed] websocket connected; subscribing to futures ticker {product}");
+    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+
+    let udp = UdpSocket::bind("0.0.0.0:0")?;
+    let mut recorder = match record {
+        Some(p) => Some(Recorder::create(p)?),
+        None => None,
+    };
+
+    let sub = format!(
+        "{{\"event\":\"subscribe\",\"feed\":\"ticker\",\"product_ids\":[\"{product}\"]}}"
+    );
+    stream.write_all(&build_frame(0x1, sub.as_bytes()))?;
+
+    let start = Instant::now();
+    let mut seq: u64 = 1;
+    let mut transit_est: u64 = 0;
+    let mut first = true;
+    stream.write_all(&build_frame(0x9, &start.elapsed().as_nanos().to_le_bytes()[..8]))?;
+    let mut last_ping = Instant::now();
+    let mut tmp = [0u8; 8192];
+
+    loop {
+        while let Some((opcode, payload, consumed)) = parse_frame(&acc) {
+            acc.drain(..consumed);
+            match opcode {
+                0x1 => {
+                    let msg = String::from_utf8_lossy(&payload);
+                    if let Some((bid, ask, mark, funding, origin_ns)) = parse_futures_ticker(&msg) {
+                        if first {
+                            println!("[kraken-feed] first ticker: mid {:.1}  spread {:.3} bps  funding {:.6}%",
+                                     mid(bid, ask), spread_bps(bid, ask), funding * 100.0);
+                            first = false;
+                        }
+                        let pkt = build_packet_v4(
+                            mid(bid, ask), 0.0, seq, origin_ns, transit_est, 0,
+                            bid, ask, mark, funding,
+                        );
+                        udp.send_to(&pkt, ingestor)?;
+                        if let Some(r) = recorder.as_mut() { r.write(&pkt)?; }
+                        seq += 1;
+                    }
+                }
+                0x9 => { stream.write_all(&build_frame(0xA, &payload))?; }
+                0xA => {
+                    if payload.len() >= 8 {
+                        let sent = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                        let rtt = (start.elapsed().as_nanos() as u64).saturating_sub(sent);
+                        transit_est = rtt / 2;
+                    }
+                }
+                0x8 => { println!("[kraken-feed] server closed connection"); return Ok(()); }
+                _ => {}
+            }
+        }
+
+        match stream.read(&mut tmp) {
+            Ok(0) => { println!("[kraken-feed] connection closed"); return Ok(()); }
+            Ok(n) => acc.extend_from_slice(&tmp[..n]),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock
+                       || e.kind() == io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(e),
+        }
+
+        if last_ping.elapsed().as_millis() as u64 >= RTT_PING_INTERVAL_MS {
+            stream.write_all(&build_frame(0x9, &start.elapsed().as_nanos().to_le_bytes()[..8]))?;
+            last_ping = Instant::now();
+        }
+    }
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -700,6 +786,8 @@ fn main() {
     let mut hours: u64 = 24;
     let mut out = RECORD_PATH_DEFAULT.to_string();
     let mut api = API_STUNNEL_ADDR.to_string();
+    let mut futures: Option<String> = None;
+    let mut futures_endpoint = FUTURES_STUNNEL_ADDR.to_string();
 
     let mut i = 1;
     while i < args.len() {
@@ -715,13 +803,18 @@ fn main() {
             "--hours"    => { if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) { hours = v; i += 1; } }
             "--out"      => { if let Some(v) = args.get(i + 1) { out = v.clone(); i += 1; } }
             "--api"      => { if let Some(v) = args.get(i + 1) { api = v.clone(); i += 1; } }
+            "--futures"  => { futures = Some(args.get(i + 1).filter(|v| !v.starts_with("--")).cloned().unwrap_or_else(|| KRAKEN_FUTURES_PRODUCT.to_string())); if args.get(i + 1).map(|v| !v.starts_with("--")).unwrap_or(false) { i += 1; } }
+            "--product"  => { if let Some(v) = args.get(i + 1) { futures = Some(v.clone()); i += 1; } }
+            "--futures-endpoint" => { if let Some(v) = args.get(i + 1) { futures_endpoint = v.clone(); i += 1; } }
             "--help" | "-h" => { print_usage(); return; }
             other => { eprintln!("[kraken-feed] unknown argument: {other}"); print_usage(); std::process::exit(2); }
         }
         i += 1;
     }
 
-    let result = if history {
+    let result = if let Some(product) = futures.as_deref() {
+        run_futures(&futures_endpoint, product, &ingestor, record.as_deref())
+    } else if history {
         run_history(&api, &pair, &ref_pair, hours, &out)
     } else if let Some(path) = synth {
         run_synth(&path)
@@ -745,6 +838,7 @@ fn print_usage() {
          \x20 kraken-feed [--live HOST:PORT] [--pair SYMBOL] [--ref-pair SYMBOL] [--ingestor ADDR] [--record FILE]\n\
          \x20 kraken-feed --replay FILE [--ingestor ADDR]\n\
          \x20 kraken-feed --synth [FILE]            (HFT_SYNTH_TICKS sets length)\n\
+         \x20 kraken-feed --futures [PRODUCT] [--futures-endpoint HOST:PORT] [--ingestor ADDR] [--record FILE]\n\
          \x20 kraken-feed --history [--hours N] [--pair SYMBOL] [--ref-pair SYMBOL] [--out FILE] [--api HOST:PORT]\n\
          \n\
          Defaults: --live {STUNNEL_ADDR}  --api {API_STUNNEL_ADDR}  --pair {KRAKEN_PAIR}  --ref-pair {KRAKEN_REF_PAIR}\n\
