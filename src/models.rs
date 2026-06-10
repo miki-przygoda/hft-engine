@@ -9,10 +9,10 @@
 //! before changing field order or sizes.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::{BUFFER_SIZE, ORDER_RING_SIZE, TRADE_LOG_SIZE};
+use crate::{BUFFER_SIZE, ORDER_RING_SIZE, ROUND_TRIP_LOG_SIZE, SIGNAL_SERIES_LEN, TRADE_LOG_SIZE};
 use rust_hft_software::config::MAX_INSTRUMENTS;
 
 /// A single market data tick — exactly one 64-byte cache line.
@@ -22,13 +22,20 @@ use rust_hft_software::config::MAX_INSTRUMENTS;
 /// publishes the tick via [`RingBuffer::latest_idx`], so the strategy sees a
 /// consistent value after the matching acquire load. Must stay 64 bytes
 /// (invariant #1) — adjust `_unused` if fields change.
+///
+/// `origin_ts_ns` and `transit_est_ns` carry live-feed metadata from the v2
+/// packet (see `config::INGEST_PACKET_SIZE_V2`). They sit in what used to be
+/// padding, so the struct is still exactly 64 bytes and the first 16 bytes are
+/// still price/volume/sequence — legacy 16-byte packets leave both fields zero.
 #[repr(C, align(64))]
 pub(crate) struct MarketTick {
-    pub(crate) price:     f32,
-    pub(crate) volume:    f32,
-    pub(crate) sequence:  u64,
-    pub(crate) timestamp: u64,
-    _unused: [u8; 36],
+    pub(crate) price:          f32,  // offset  0
+    pub(crate) volume:         f32,  // offset  4
+    pub(crate) sequence:       u64,  // offset  8
+    pub(crate) timestamp:      u64,  // offset 16 — ingest time (ns since engine start)
+    pub(crate) origin_ts_ns:   u64,  // offset 24 — exchange trade time (ns since epoch)
+    pub(crate) transit_est_ns: u64,  // offset 32 — RTT/2 one-way transit estimate
+    _unused: [u8; 20],               // offset 40 — padding to 64 bytes
 }
 
 /// Lock-free SPSC ring buffer delivering ticks from the ingestor to the strategy.
@@ -45,21 +52,36 @@ pub(crate) struct RingBuffer {
     pub(crate) start_time: Instant,    // offset 65544 — same cache line as latest_idx
 }
 
-/// One recorded trade and its latency breakdown (48 bytes, 6 × u64).
+/// One recorded trade: its full-stack latency breakdown and its fill/slippage
+/// (64 bytes, 7×u64 + 2×f32).
 ///
-/// The strategy fills every field except `round_trip_ns` and commits the slot;
-/// the exchange thread later fills `round_trip_ns` on that already-committed
-/// slot (invariant #4). The 6-u64 size is assumed by the trade-log pre-touch
-/// loop in `main` (invariant #10).
+/// The strategy fills every field except `round_trip_ns` (written by the exchange
+/// thread) and `fill_price` (written later, when the simulated market fill becomes
+/// due — one transit after the order is sent). The 64-byte size is assumed by the
+/// trade-log pre-touch loop in `main` (invariant #10).
+///
+/// `target_price` is the price we intended to buy at (the configured target in
+/// target mode, or the entry price in breakout mode); `fill_price` is the market
+/// price one transit later (0.0 = still pending at shutdown). Their difference is
+/// the latency-induced slippage.
 #[derive(Copy, Clone)]
 pub(crate) struct TradeExecution {
     pub sequence:       u64,
     pub ingest_time_ns: u64,
     pub buy_time_ns:    u64,
-    pub latency_ns:     u64,
+    pub latency_ns:     u64,   // signal latency: buy_time_ns - ingest_time_ns
     pub order_send_ns:  u64,
-    pub round_trip_ns:  u64,
+    pub round_trip_ns:  u64,   // written by exchange thread
+    pub transit_est_ns: u64,   // RTT/2 transit estimate, copied from the tick
+    pub target_price:   f32,   // intended buy price (config target, or entry price)
+    pub fill_price:     f32,   // market price one transit later (0.0 = unfilled)
 }
+
+// Layout invariants, checked at compile time.
+//   #1:  MarketTick stays exactly 64 bytes (one cache line; pre-touch step = 8).
+//   #10: TradeExecution stays 64 bytes (pre-touch step = 8 in main.rs).
+const _: () = assert!(std::mem::size_of::<MarketTick>() == 64);
+const _: () = assert!(std::mem::size_of::<TradeExecution>() == 64);
 
 /// Single-writer lock-free latency log.
 ///
@@ -119,7 +141,7 @@ impl LatencyHistogram {
     // Returns 10_001 if the percentile falls in the overflow bucket.
     pub(crate) fn percentile(&self, p_num: u64, p_den: u64, total: u64) -> u64 {
         if total == 0 { return 0; }
-        let threshold = ((total * p_num + p_den - 1) / p_den).max(1);
+        let threshold = (total * p_num).div_ceil(p_den).max(1);
         let mut cum = 0u64;
         let buckets = unsafe { &*self.buckets.get() };
         for (i, &count) in buckets.iter().enumerate() {
@@ -131,6 +153,78 @@ impl LatencyHistogram {
         10_001
     }
 }
+
+/// Trading-model configuration (set once by `main` from env vars; read-only after).
+/// Plain `Copy` data shared across threads. `enabled` gates the whole trade path.
+#[derive(Copy, Clone)]
+pub(crate) struct TradeCfg {
+    pub enabled:       bool,
+    pub allow_short:   bool,
+    pub entry_dip_bps: f32,   // long when price ≤ ref·(1-x); short when ≥ ref·(1+x)
+    pub tp_bps:        f32,   // take-profit (favourable move from entry)
+    pub sl_bps:        f32,   // stop-loss (adverse move from entry)
+    pub fee_bps:       f32,   // taker fee charged per side
+    pub leverage:      f32,
+    pub max_size_mult: f32,   // cap on dynamic size scaling
+    pub adaptive:      bool,  // entry/TP/SL as multiples of rolling volatility
+    pub use_flow:      bool,  // require order-flow (signed-volume) confirmation
+    pub capital:       f32,   // starting capital (quote); equity compounds from here
+    pub risk_frac:     f32,   // fraction of equity used as margin per trade
+    // ── Trend-following + cross-market signal (HFT_MOMENTUM) ──
+    pub momentum:        bool, // gate: trade WITH the trend (else mean-reversion)
+    pub w_trend:         f32,  // composite-S weights
+    pub w_flow:          f32,
+    pub w_basket:        f32,
+    pub w_leadlag:       f32,
+    pub signal_thr_bps:  f32,  // |S| gate to call a trend
+    pub pullback_bps:    f32,  // dip/rip vs fast EMA to time entry
+    pub trail_bps:       f32,  // trailing-stop retrace
+    pub signal_exit_bps: f32,  // exit when S weakens past this
+    pub beta:            f32,  // lead-lag transfer coefficient
+    // Cost-aware execution (default off → current behavior).
+    pub maker:           bool, // entry pays maker fee (passive) instead of taker
+    pub maker_bps:       f32,  // entry-side maker fee under `maker` (can be negative)
+    pub fee_gate:        bool, // require expected move ≥ round-trip cost + min_edge
+    pub min_edge_bps:    f32,  // edge buffer over cost for the fee gate
+    pub normalize:       bool, // z-score the composite-signal terms
+}
+
+/// One completed round-trip (entry → exit), the unit of the P&L scorecard.
+/// 64 bytes (4×u64 + 8×f32). Single writer: the strategy thread, on each exit.
+#[derive(Copy, Clone)]
+pub(crate) struct RoundTrip {
+    pub entry_time_ns: u64,
+    pub exit_time_ns:  u64,
+    pub hold_ns:       u64,
+    pub side:          i64,   // +1 long, -1 short
+    pub entry_price:   f32,
+    pub exit_price:    f32,
+    pub size:          f32,
+    pub gross_bps:     f32,   // signed favourable move, before fees
+    pub net_bps:       f32,   // gross_bps - 2·fee_bps
+    pub pnl_quote:     f32,   // net P&L in quote currency, including leverage
+    pub fees_quote:    f32,   // total fees paid (both sides), quote currency
+    pub flags:         f32,   // 1.0 = closed by liquidation, else 0.0
+}
+
+/// Single-writer lock-free log of completed round-trips (same protocol as TradeLog).
+pub(crate) struct RoundTripLog {
+    pub(crate) entries:   UnsafeCell<[RoundTrip; ROUND_TRIP_LOG_SIZE]>,
+    pub(crate) write_idx: AtomicU64,
+}
+
+unsafe impl Sync for RoundTripLog {}
+
+impl RoundTripLog {
+    pub(crate) fn new() -> Self {
+        RoundTripLog {
+            entries:   UnsafeCell::new(unsafe { std::mem::zeroed() }),
+            write_idx: AtomicU64::new(0),
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<RoundTrip>() == 64);
 
 /// Shared run state: the trade log, both latency histograms, and the run's
 /// bookkeeping atomics (stall/gap counters, the dirty-feed flag, the risk
@@ -151,6 +245,49 @@ pub(crate) struct OrderBook {
     pub(crate) mem_total_ram:  AtomicU64,       // total physical RAM (bytes), snapshot [1]
     pub(crate) mem_rss_start:  AtomicU64,       // peak RSS before buffer allocation, snapshot [1]
     pub(crate) mem_rss_ready:  AtomicU64,       // peak RSS after pre-touch + process setup, snapshot [2]
+    // Execution / slippage tracking.
+    pub(crate) attempts:      AtomicU64,        // buy attempts (sole writer: strategy)
+    pub(crate) filled:        AtomicU64,        // attempts whose simulated fill resolved (sole writer: strategy)
+    pub(crate) price_lo_bits: AtomicU32,        // min observed price (f32 bits); sole writer: ingestor
+    pub(crate) price_hi_bits: AtomicU32,        // max observed price (f32 bits); sole writer: ingestor
+    // Target-price buy level, set once by main from HFT_TARGET_PRICE. 0.0 = breakout mode.
+    pub(crate) target_price:  f32,
+    // Relative-dip threshold in bps (HFT_TARGET_DIP_BPS). >0 = buy on a dip of this
+    // many bps below a rolling reference; adapts to any price level. Takes priority
+    // over target_price.
+    pub(crate) target_dip_bps: f32,
+    // Downtick mode (HFT_DOWNTICK): buy on any price decrease. Guaranteed to fire on
+    // any feed that moves at all — the fallback for very flat/thin markets. Highest
+    // priority among the buy triggers.
+    pub(crate) buy_on_downtick: bool,
+    // ── Trading model (HFT_TRADE) ───────────────────────────────────────────
+    pub(crate) trade_cfg:   TradeCfg,        // set once by main
+    pub(crate) round_trips: RoundTripLog,    // completed round-trips; sole writer: strategy
+    pub(crate) vol_ema_bits: AtomicU32,      // final rolling volatility est (f32 bps bits); writer: strategy
+    // ── Composite signal output (HFT_MOMENTUM) ──
+    pub(crate) latest_signal_bits: AtomicU32,// latest S (f32 bps bits), written every tick by strategy
+    pub(crate) signal:      SignalLog,       // downsampled S series + per-trade S; sole writer: strategy
+}
+
+/// Signal output log (single writer: strategy). `series` is a downsampled ring of
+/// the composite signal S; `at_entry[k]` is S at the entry of round-trip k. Both
+/// are read only at shutdown. Mirrors the lock-free single-writer pattern of TradeLog.
+pub(crate) struct SignalLog {
+    pub(crate) series:     UnsafeCell<[f32; SIGNAL_SERIES_LEN]>,
+    pub(crate) series_idx: AtomicU64,
+    pub(crate) at_entry:   UnsafeCell<[f32; ROUND_TRIP_LOG_SIZE]>,
+}
+
+unsafe impl Sync for SignalLog {}
+
+impl SignalLog {
+    pub(crate) fn new() -> Self {
+        SignalLog {
+            series:     UnsafeCell::new([0.0; SIGNAL_SERIES_LEN]),
+            series_idx: AtomicU64::new(0),
+            at_entry:   UnsafeCell::new([0.0; ROUND_TRIP_LOG_SIZE]),
+        }
+    }
 }
 
 // ── Multi-instrument scaffold (item 8) ──────────────────────────────────────

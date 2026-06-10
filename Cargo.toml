@@ -21,3 +21,11 @@ path = "src/testing_scripts/multi_threaded.rs"
 [features]
 testing = []  # Enable to compile testing_scripts module
 
+# Workaround for a rustc ICE ("computing target features for inline asm of
+# engine::trading_strategy") that only triggers in the incremental TEST profile
+# build of the SIMD signal. Release builds (CI's gate) and `cargo test --release`
+# are unaffected; disabling incremental for the test profile lets plain
+# `cargo test` run. Tracked as a compiler bug, not a logic issue.
+[profile.test]
+incremental = false
+
