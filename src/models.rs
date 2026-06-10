@@ -35,7 +35,11 @@ pub(crate) struct MarketTick {
     pub(crate) timestamp:      u64,  // offset 16 — ingest time (ns since engine start)
     pub(crate) origin_ts_ns:   u64,  // offset 24 — exchange trade time (ns since epoch)
     pub(crate) transit_est_ns: u64,  // offset 32 — RTT/2 one-way transit estimate
-    _unused: [u8; 20],               // offset 40 — padding to 64 bytes
+    pub(crate) bid:            f32,  // offset 40 — best bid (v4; 0 if not provided)
+    pub(crate) ask:            f32,  // offset 44 — best ask (v4)
+    pub(crate) mark_price:     f32,  // offset 48 — perp mark price (v4)
+    pub(crate) funding_rate:   f32,  // offset 52 — current funding rate (v4)
+    _unused: [u8; 8],                // offset 56 — padding to 64 bytes
 }
 
 /// Lock-free SPSC ring buffer delivering ticks from the ingestor to the strategy.
@@ -250,6 +254,9 @@ pub(crate) struct OrderBook {
     pub(crate) filled:        AtomicU64,        // attempts whose simulated fill resolved (sole writer: strategy)
     pub(crate) price_lo_bits: AtomicU32,        // min observed price (f32 bits); sole writer: ingestor
     pub(crate) price_hi_bits: AtomicU32,        // max observed price (f32 bits); sole writer: ingestor
+    pub(crate) spread_lo_bits: AtomicU32,       // min observed spread (f32 bps bits); sole writer: ingestor
+    pub(crate) spread_hi_bits: AtomicU32,       // max observed spread (f32 bps bits); sole writer: ingestor
+    pub(crate) funding_bits:   AtomicU32,       // latest funding rate (f32 bits); sole writer: ingestor
     // Target-price buy level, set once by main from HFT_TARGET_PRICE. 0.0 = breakout mode.
     pub(crate) target_price:  f32,
     // Relative-dip threshold in bps (HFT_TARGET_DIP_BPS). >0 = buy on a dip of this

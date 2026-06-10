@@ -39,8 +39,9 @@ use std::net::{TcpStream, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rust_hft_software::config::{
-    API_STUNNEL_ADDR, INGESTOR_ADDR, KRAKEN_API_HOST, KRAKEN_HOST, KRAKEN_PAIR,
-    KRAKEN_REF_PAIR, RECORD_PATH_DEFAULT, RTT_PING_INTERVAL_MS, STUNNEL_ADDR,
+    API_STUNNEL_ADDR, FUTURES_STUNNEL_ADDR, INGESTOR_ADDR, KRAKEN_API_HOST, KRAKEN_FUTURES_HOST,
+    KRAKEN_FUTURES_PRODUCT, KRAKEN_HOST, KRAKEN_PAIR, KRAKEN_REF_PAIR, RECORD_PATH_DEFAULT,
+    RTT_PING_INTERVAL_MS, STUNNEL_ADDR,
 };
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -59,6 +60,23 @@ fn build_packet(price: f32, volume: f32, seq: u64, origin_ts_ns: u64, transit_es
     p[16..24].copy_from_slice(&origin_ts_ns.to_le_bytes());
     p[24..32].copy_from_slice(&transit_est_ns.to_le_bytes());
     p[32] = instrument;
+    p
+}
+
+/// Build the 49-byte v4 packet: the 33-byte v3 layout plus bid/ask/mark_price/
+/// funding_rate as four little-endian f32s. The first 33 bytes are byte-identical
+/// to v3, so older ingestors stay valid (they parse only what they understand).
+#[allow(clippy::too_many_arguments)]
+fn build_packet_v4(
+    price: f32, volume: f32, seq: u64, origin_ts_ns: u64, transit_est_ns: u64,
+    instrument: u8, bid: f32, ask: f32, mark_price: f32, funding_rate: f32,
+) -> [u8; 49] {
+    let mut p = [0u8; 49];
+    p[..33].copy_from_slice(&build_packet(price, volume, seq, origin_ts_ns, transit_est_ns, instrument));
+    p[33..37].copy_from_slice(&bid.to_le_bytes());
+    p[37..41].copy_from_slice(&ask.to_le_bytes());
+    p[41..45].copy_from_slice(&mark_price.to_le_bytes());
+    p[45..49].copy_from_slice(&funding_rate.to_le_bytes());
     p
 }
 
@@ -259,6 +277,51 @@ fn parse_kraken_ts(s: &str) -> Option<u64> {
     Some(sec.wrapping_mul(1_000_000_000).wrapping_add(frac_ns))
 }
 
+// ── Kraken Futures ticker parsing ─────────────────────────────────────────────
+
+/// Extract the JSON number that follows `"key":` in `msg` (handles integers,
+/// decimals, and scientific notation). `None` if the key is absent or the value
+/// is not a bare number (e.g. a string). Good enough for Kraken's flat ticker
+/// objects — not a general JSON parser.
+fn json_num(msg: &str, key: &str) -> Option<f64> {
+    let pat = format!("\"{key}\":");
+    let start = msg.find(&pat)? + pat.len();
+    let rest = msg[start..].trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')))
+        .unwrap_or(rest.len());
+    rest[..end].parse::<f64>().ok()
+}
+
+/// Parse a Kraken **Futures** public `ticker` message → `(bid, ask, mark_price,
+/// funding_rate, origin_ts_ns)`. The feed is a flat JSON object with `bid`, `ask`,
+/// `markPrice`, `funding_rate` (omitted when zero → defaulted to 0.0), and `time`
+/// (ms since epoch). Returns `None` for any frame that is not a populated ticker
+/// (subscription acks, heartbeats, or missing bid/ask).
+fn parse_futures_ticker(msg: &str) -> Option<(f32, f32, f32, f32, u64)> {
+    if !msg.contains("\"feed\":\"ticker\"") || !msg.contains("\"bid\":") {
+        return None;
+    }
+    let bid = json_num(msg, "bid")? as f32;
+    let ask = json_num(msg, "ask")? as f32;
+    if !(bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0) {
+        return None;
+    }
+    let mark = json_num(msg, "markPrice").map(|v| v as f32).unwrap_or((bid + ask) / 2.0);
+    let funding = json_num(msg, "funding_rate").map(|v| v as f32).unwrap_or(0.0);
+    let origin_ns = json_num(msg, "time").map(|ms| (ms as u64).wrapping_mul(1_000_000)).unwrap_or(0);
+    Some((bid, ask, mark, funding, origin_ns))
+}
+
+/// Mid price from best bid/ask.
+fn mid(bid: f32, ask: f32) -> f32 { (bid + ask) / 2.0 }
+
+/// Bid/ask spread in basis points of the mid. 0.0 for a degenerate quote.
+fn spread_bps(bid: f32, ask: f32) -> f32 {
+    let m = mid(bid, ask);
+    if m > 0.0 { (ask - bid) / m * 10_000.0 } else { 0.0 }
+}
+
 // ── WebSocket handshake ───────────────────────────────────────────────────────
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -418,8 +481,18 @@ fn run_synth(path: &str) -> io::Result<()> {
         let transit = 33_000_000 + (seq.wrapping_mul(2_654_435) % 8_000_000);
         let origin = 1_700_000_000_000_000_000u64.wrapping_add(seq.wrapping_mul(5_000_000));
         // Emit reference (id 1) then traded (id 0), 2.5 ms apart (≈5 ms/round).
+        // Synthetic microstructure: a small spread around mid (≈1.5 bps) and a tiny
+        // slowly-varying funding rate, so offline replay/backtest exercise the v4
+        // fields deterministically. Funding only meaningful for the traded perp.
+        let funding = (0.000_01 * (seq as f64 * 0.01).sin()) as f32;
         for (price, vol, id) in [(ref_price, ref_vol, 1u8), (traded_price, traded_vol, 0u8)] {
-            let pkt = build_packet(price as f32, vol, seq, origin, transit, id);
+            let half = (price * 0.000_075) as f32;         // ≈0.75 bps each side → ~1.5 bps spread
+            let bid = price as f32 - half;
+            let ask = price as f32 + half;
+            let pkt = build_packet_v4(
+                price as f32, vol, seq, origin, transit, id,
+                bid, ask, price as f32, if id == 0 { funding } else { 0.0 },
+            );
             rec.file.write_all(&2_500_000u64.to_le_bytes())?;
             rec.file.write_all(&(pkt.len() as u16).to_le_bytes())?;
             rec.file.write_all(&pkt)?;
@@ -596,12 +669,93 @@ fn run_live(
                     }
                 }
                 0x9 => { stream.write_all(&build_frame(0xA, &payload))?; } // ping → pong
-                0xA => {
-                    if payload.len() >= 8 {
-                        let sent = u64::from_le_bytes(payload[..8].try_into().unwrap());
-                        let rtt = (start.elapsed().as_nanos() as u64).saturating_sub(sent);
-                        transit_est = rtt / 2;
+                0xA if payload.len() >= 8 => {
+                    let sent = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                    let rtt = (start.elapsed().as_nanos() as u64).saturating_sub(sent);
+                    transit_est = rtt / 2;
+                }
+                0x8 => { println!("[kraken-feed] server closed connection"); return Ok(()); }
+                _ => {}
+            }
+        }
+
+        match stream.read(&mut tmp) {
+            Ok(0) => { println!("[kraken-feed] connection closed"); return Ok(()); }
+            Ok(n) => acc.extend_from_slice(&tmp[..n]),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock
+                       || e.kind() == io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(e),
+        }
+
+        if last_ping.elapsed().as_millis() as u64 >= RTT_PING_INTERVAL_MS {
+            stream.write_all(&build_frame(0x9, &start.elapsed().as_nanos().to_le_bytes()[..8]))?;
+            last_ping = Instant::now();
+        }
+    }
+}
+
+/// Stream the Kraken **Futures** public `ticker` feed (bid/ask/mark/funding) for
+/// `product` and emit v4 packets. Public feed → no auth (challenge/sign is only
+/// for private order feeds). Mirrors `run_live` but parses the futures ticker and
+/// sets the packet price to the mid.
+fn run_futures(
+    endpoint: &str,
+    product: &str,
+    ingestor: &str,
+    record: Option<&str>,
+) -> io::Result<()> {
+    println!("[kraken-feed] connecting to {endpoint} (stunnel → {KRAKEN_FUTURES_HOST}:443)");
+    let mut stream = TcpStream::connect(endpoint)?;
+    stream.set_nodelay(true).ok();
+    let mut acc = ws_handshake(&mut stream, KRAKEN_FUTURES_HOST)?;
+    println!("[kraken-feed] websocket connected; subscribing to futures ticker {product}");
+    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+
+    let udp = UdpSocket::bind("0.0.0.0:0")?;
+    let mut recorder = match record {
+        Some(p) => Some(Recorder::create(p)?),
+        None => None,
+    };
+
+    let sub = format!(
+        "{{\"event\":\"subscribe\",\"feed\":\"ticker\",\"product_ids\":[\"{product}\"]}}"
+    );
+    stream.write_all(&build_frame(0x1, sub.as_bytes()))?;
+
+    let start = Instant::now();
+    let mut seq: u64 = 1;
+    let mut transit_est: u64 = 0;
+    let mut first = true;
+    stream.write_all(&build_frame(0x9, &start.elapsed().as_nanos().to_le_bytes()[..8]))?;
+    let mut last_ping = Instant::now();
+    let mut tmp = [0u8; 8192];
+
+    loop {
+        while let Some((opcode, payload, consumed)) = parse_frame(&acc) {
+            acc.drain(..consumed);
+            match opcode {
+                0x1 => {
+                    let msg = String::from_utf8_lossy(&payload);
+                    if let Some((bid, ask, mark, funding, origin_ns)) = parse_futures_ticker(&msg) {
+                        if first {
+                            println!("[kraken-feed] first ticker: mid {:.1}  spread {:.3} bps  funding {:.6}%",
+                                     mid(bid, ask), spread_bps(bid, ask), funding * 100.0);
+                            first = false;
+                        }
+                        let pkt = build_packet_v4(
+                            mid(bid, ask), 0.0, seq, origin_ns, transit_est, 0,
+                            bid, ask, mark, funding,
+                        );
+                        udp.send_to(&pkt, ingestor)?;
+                        if let Some(r) = recorder.as_mut() { r.write(&pkt)?; }
+                        seq += 1;
                     }
+                }
+                0x9 => { stream.write_all(&build_frame(0xA, &payload))?; }
+                0xA if payload.len() >= 8 => {
+                    let sent = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                    let rtt = (start.elapsed().as_nanos() as u64).saturating_sub(sent);
+                    transit_est = rtt / 2;
                 }
                 0x8 => { println!("[kraken-feed] server closed connection"); return Ok(()); }
                 _ => {}
@@ -638,6 +792,8 @@ fn main() {
     let mut hours: u64 = 24;
     let mut out = RECORD_PATH_DEFAULT.to_string();
     let mut api = API_STUNNEL_ADDR.to_string();
+    let mut futures: Option<String> = None;
+    let mut futures_endpoint = FUTURES_STUNNEL_ADDR.to_string();
 
     let mut i = 1;
     while i < args.len() {
@@ -653,13 +809,18 @@ fn main() {
             "--hours"    => { if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) { hours = v; i += 1; } }
             "--out"      => { if let Some(v) = args.get(i + 1) { out = v.clone(); i += 1; } }
             "--api"      => { if let Some(v) = args.get(i + 1) { api = v.clone(); i += 1; } }
+            "--futures"  => { futures = Some(args.get(i + 1).filter(|v| !v.starts_with("--")).cloned().unwrap_or_else(|| KRAKEN_FUTURES_PRODUCT.to_string())); if args.get(i + 1).map(|v| !v.starts_with("--")).unwrap_or(false) { i += 1; } }
+            "--product"  => { if let Some(v) = args.get(i + 1) { futures = Some(v.clone()); i += 1; } }
+            "--futures-endpoint" => { if let Some(v) = args.get(i + 1) { futures_endpoint = v.clone(); i += 1; } }
             "--help" | "-h" => { print_usage(); return; }
             other => { eprintln!("[kraken-feed] unknown argument: {other}"); print_usage(); std::process::exit(2); }
         }
         i += 1;
     }
 
-    let result = if history {
+    let result = if let Some(product) = futures.as_deref() {
+        run_futures(&futures_endpoint, product, &ingestor, record.as_deref())
+    } else if history {
         run_history(&api, &pair, &ref_pair, hours, &out)
     } else if let Some(path) = synth {
         run_synth(&path)
@@ -683,6 +844,7 @@ fn print_usage() {
          \x20 kraken-feed [--live HOST:PORT] [--pair SYMBOL] [--ref-pair SYMBOL] [--ingestor ADDR] [--record FILE]\n\
          \x20 kraken-feed --replay FILE [--ingestor ADDR]\n\
          \x20 kraken-feed --synth [FILE]            (HFT_SYNTH_TICKS sets length)\n\
+         \x20 kraken-feed --futures [PRODUCT] [--futures-endpoint HOST:PORT] [--ingestor ADDR] [--record FILE]\n\
          \x20 kraken-feed --history [--hours N] [--pair SYMBOL] [--ref-pair SYMBOL] [--out FILE] [--api HOST:PORT]\n\
          \n\
          Defaults: --live {STUNNEL_ADDR}  --api {API_STUNNEL_ADDR}  --pair {KRAKEN_PAIR}  --ref-pair {KRAKEN_REF_PAIR}\n\
@@ -772,5 +934,61 @@ mod tests {
         assert_eq!(trades[0].2, 1_700_000_000_500_000_000);        // 1700000000.5 s → ns
         assert!((trades[1].1 + 0.2).abs() < 1e-6);                 // sell → negative
         assert_eq!(last, "1700000001000000000");
+    }
+
+    #[test]
+    fn build_v4_packet_layout() {
+        let p = build_packet_v4(60000.0, 0.0, 7, 1_700_000_000_000_000_000, 1234, 0,
+                                59995.0, 60005.0, 60001.0, 1.2e-7);
+        assert_eq!(p.len(), 49);
+        // First 33 bytes are byte-identical to a v3 packet.
+        let v3 = build_packet(60000.0, 0.0, 7, 1_700_000_000_000_000_000, 1234, 0);
+        assert_eq!(&p[..33], &v3[..]);
+        // v4 tail: bid/ask/mark/funding as little-endian f32.
+        assert_eq!(f32::from_le_bytes(p[33..37].try_into().unwrap()), 59995.0);
+        assert_eq!(f32::from_le_bytes(p[37..41].try_into().unwrap()), 60005.0);
+        assert_eq!(f32::from_le_bytes(p[41..45].try_into().unwrap()), 60001.0);
+        assert_eq!(f32::from_le_bytes(p[45..49].try_into().unwrap()), 1.2e-7);
+    }
+
+    #[test]
+    fn json_num_extracts_numbers() {
+        let m = r#"{"a":12.5,"b":-3,"c":1.2e-7,"d":"x"}"#;
+        assert_eq!(json_num(m, "a"), Some(12.5));
+        assert_eq!(json_num(m, "b"), Some(-3.0));
+        assert_eq!(json_num(m, "c"), Some(1.2e-7));
+        assert_eq!(json_num(m, "missing"), None);
+    }
+
+    #[test]
+    fn parse_futures_ticker_message() {
+        let msg = r#"{"feed":"ticker","product_id":"PF_XBTUSD","bid":60234.0,"ask":60235.5,"markPrice":60234.8,"last":60234.5,"funding_rate":1.2e-7,"time":1718040000000}"#;
+        let t = parse_futures_ticker(msg).expect("a ticker");
+        assert!((t.0 - 60234.0).abs() < 0.01);   // bid
+        assert!((t.1 - 60235.5).abs() < 0.01);   // ask
+        assert!((t.2 - 60234.8).abs() < 0.01);   // mark
+        assert!((t.3 - 1.2e-7).abs() < 1e-12);   // funding
+        assert_eq!(t.4, 1_718_040_000_000_000_000); // time ms → ns
+    }
+
+    #[test]
+    fn parse_futures_ticker_absent_funding_is_zero() {
+        let msg = r#"{"feed":"ticker","product_id":"PF_XBTUSD","bid":60234.0,"ask":60235.5,"markPrice":60234.8,"time":1718040000000}"#;
+        let t = parse_futures_ticker(msg).expect("a ticker");
+        assert_eq!(t.3, 0.0);                    // funding omitted → 0.0
+    }
+
+    #[test]
+    fn parse_futures_ticker_non_ticker_is_none() {
+        assert!(parse_futures_ticker(r#"{"event":"subscribed","feed":"ticker"}"#).is_none());
+        assert!(parse_futures_ticker(r#"{"feed":"heartbeat"}"#).is_none());
+    }
+
+    #[test]
+    fn mid_and_spread_bps() {
+        assert!((mid(59995.0, 60005.0) - 60000.0).abs() < 0.01);
+        // spread = 10 / 60000 * 1e4 ≈ 1.667 bps
+        assert!((spread_bps(59995.0, 60005.0) - 1.6667).abs() < 0.01);
+        assert_eq!(spread_bps(0.0, 0.0), 0.0);   // degenerate → 0, no NaN
     }
 }

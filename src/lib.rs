@@ -55,6 +55,9 @@ pub mod config {
     // cross-market reference) can be routed to its own ring buffer.
     // Back-compat: amt<32 legacy, 32<=amt<33 v2 (id 0), amt>=33 reads pkt[32].
     pub const INGEST_PACKET_SIZE_V3: usize = 33;
+    // v4 packet appends bid/ask/mark_price/funding_rate (4×f32) at [33..49] for the
+    // Kraken Futures feed. First 33 bytes stay byte-identical to v3 (amt>=49 reads them).
+    pub const INGEST_PACKET_SIZE_V4: usize = 49;
     pub const N_INSTRUMENTS: usize = 2;  // traded (0) + reference (1); scaffold allows MAX_INSTRUMENTS
 
     // Kraken WebSocket v1 feed. TLS is terminated by a local stunnel instance
@@ -66,6 +69,11 @@ pub mod config {
     // Kraken REST (historical trades) via a second stunnel service → api.kraken.com:443.
     pub const KRAKEN_API_HOST: &str = "api.kraken.com";
     pub const API_STUNNEL_ADDR: &str = "127.0.0.1:8444";
+    // Kraken Futures public market-data feed (no auth) via a third stunnel service
+    // → futures.kraken.com:443. Distinct accept port from spot (8443) / api (8444).
+    pub const KRAKEN_FUTURES_HOST: &str = "futures.kraken.com";
+    pub const FUTURES_STUNNEL_ADDR: &str = "127.0.0.1:8445";
+    pub const KRAKEN_FUTURES_PRODUCT: &str = "PF_XBTUSD";  // linear, USD-collateral perp
 
     // RTT probe cadence: how often the adapter sends a WebSocket ping to refresh
     // its RTT/2 one-way transit estimate.
