@@ -62,6 +62,23 @@ fn build_packet(price: f32, volume: f32, seq: u64, origin_ts_ns: u64, transit_es
     p
 }
 
+/// Build the 49-byte v4 packet: the 33-byte v3 layout plus bid/ask/mark_price/
+/// funding_rate as four little-endian f32s. The first 33 bytes are byte-identical
+/// to v3, so older ingestors stay valid (they parse only what they understand).
+#[allow(clippy::too_many_arguments)]
+fn build_packet_v4(
+    price: f32, volume: f32, seq: u64, origin_ts_ns: u64, transit_est_ns: u64,
+    instrument: u8, bid: f32, ask: f32, mark_price: f32, funding_rate: f32,
+) -> [u8; 49] {
+    let mut p = [0u8; 49];
+    p[..33].copy_from_slice(&build_packet(price, volume, seq, origin_ts_ns, transit_est_ns, instrument));
+    p[33..37].copy_from_slice(&bid.to_le_bytes());
+    p[37..41].copy_from_slice(&ask.to_le_bytes());
+    p[41..45].copy_from_slice(&mark_price.to_le_bytes());
+    p[45..49].copy_from_slice(&funding_rate.to_le_bytes());
+    p
+}
+
 // ── base64 + SHA-1 (hand-rolled, no deps) ─────────────────────────────────────
 
 fn base64_encode(input: &[u8]) -> String {
@@ -772,5 +789,20 @@ mod tests {
         assert_eq!(trades[0].2, 1_700_000_000_500_000_000);        // 1700000000.5 s → ns
         assert!((trades[1].1 + 0.2).abs() < 1e-6);                 // sell → negative
         assert_eq!(last, "1700000001000000000");
+    }
+
+    #[test]
+    fn build_v4_packet_layout() {
+        let p = build_packet_v4(60000.0, 0.0, 7, 1_700_000_000_000_000_000, 1234, 0,
+                                59995.0, 60005.0, 60001.0, 1.2e-7);
+        assert_eq!(p.len(), 49);
+        // First 33 bytes are byte-identical to a v3 packet.
+        let v3 = build_packet(60000.0, 0.0, 7, 1_700_000_000_000_000_000, 1234, 0);
+        assert_eq!(&p[..33], &v3[..]);
+        // v4 tail: bid/ask/mark/funding as little-endian f32.
+        assert_eq!(f32::from_le_bytes(p[33..37].try_into().unwrap()), 59995.0);
+        assert_eq!(f32::from_le_bytes(p[37..41].try_into().unwrap()), 60005.0);
+        assert_eq!(f32::from_le_bytes(p[41..45].try_into().unwrap()), 60001.0);
+        assert_eq!(f32::from_le_bytes(p[45..49].try_into().unwrap()), 1.2e-7);
     }
 }
