@@ -312,6 +312,15 @@ fn parse_futures_ticker(msg: &str) -> Option<(f32, f32, f32, f32, u64)> {
     Some((bid, ask, mark, funding, origin_ns))
 }
 
+/// Mid price from best bid/ask.
+fn mid(bid: f32, ask: f32) -> f32 { (bid + ask) / 2.0 }
+
+/// Bid/ask spread in basis points of the mid. 0.0 for a degenerate quote.
+fn spread_bps(bid: f32, ask: f32) -> f32 {
+    let m = mid(bid, ask);
+    if m > 0.0 { (ask - bid) / m * 10_000.0 } else { 0.0 }
+}
+
 // ── WebSocket handshake ───────────────────────────────────────────────────────
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -873,5 +882,13 @@ mod tests {
     fn parse_futures_ticker_non_ticker_is_none() {
         assert!(parse_futures_ticker(r#"{"event":"subscribed","feed":"ticker"}"#).is_none());
         assert!(parse_futures_ticker(r#"{"feed":"heartbeat"}"#).is_none());
+    }
+
+    #[test]
+    fn mid_and_spread_bps() {
+        assert!((mid(59995.0, 60005.0) - 60000.0).abs() < 0.01);
+        // spread = 10 / 60000 * 1e4 ≈ 1.667 bps
+        assert!((spread_bps(59995.0, 60005.0) - 1.6667).abs() < 0.01);
+        assert_eq!(spread_bps(0.0, 0.0), 0.0);   // degenerate → 0, no NaN
     }
 }
