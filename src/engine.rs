@@ -1075,8 +1075,8 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
             println!("Observed price range: [{:.2}, {:.2}]  ({:.1} bps span)  |  volatility ~{:.2} bps/tick",
                      lo, hi, range_bps, vol);
             if spread_lo.is_finite() && spread_hi.is_finite() {
-                println!("Market data: spread {:.2}–{:.2} bps  |  funding {:.6}% (latest)",
-                         spread_lo, spread_hi, funding * 100.0);
+                println!("Market data: spread {:.2}–{:.2} bps  |  funding {:.8} (raw, latest)",
+                         spread_lo, spread_hi, funding);
             }
         }
         match scorecard(rts, cfg.capital as f64) {
@@ -1138,8 +1138,8 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
         let range_bps = if lo > 0.0 { (hi - lo) / lo * 10_000.0 } else { 0.0 };
         println!("Observed price range: [{:.4}, {:.4}]  ({:.2} bps span)", lo, hi, range_bps);
         if spread_lo.is_finite() && spread_hi.is_finite() {
-            println!("Market data: spread {:.2}–{:.2} bps  |  funding {:.6}% (latest)",
-                     spread_lo, spread_hi, funding * 100.0);
+            println!("Market data: spread {:.2}–{:.2} bps  |  funding {:.8} (raw, latest)",
+                     spread_lo, spread_hi, funding);
         }
         if attempts == 0 {
             println!("  → no buys triggered. The market moved only {:.2} bps this run; try", range_bps);
