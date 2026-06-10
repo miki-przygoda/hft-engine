@@ -284,15 +284,18 @@ HFT_TRADE=1 HFT_ADAPTIVE=1 make replay
 HFT_TRADE=1 HFT_ADAPTIVE=1 HFT_FEE_BPS=0 make replay   # isolate the gross edge
 ```
 
-On the realistic synth the model shows a real **gross** edge (≈71% win, profit factor ~2) of ~0.4 bps/trade — which a realistic ~5 bps round-trip fee wipes out. That fee sensitivity is the point: micro mean-reversion is a negative-edge game once you pay to cross the spread.
+On the realistic (trending) synth, mean-reversion *fights the drift*: gross hit rate ≈45%, and the edge is **negative even before fees** (gross −2.4 bps/trade) — a realistic ~5 bps round-trip fee only deepens it. The backtest sweep makes it undeniable: every fixed-weight config is negative out-of-sample (best −0.44%), and z-scoring the signal is what claws the best one barely positive (+0.04%, see below). That's the point: micro mean-reversion is a negative-edge game once you pay to cross the spread — the scorecard reports it honestly rather than hiding it.
 
 ```
-TRADING SCORECARD  (long&short mean-reversion, 2x leverage, 2.6 bps/side fee)
-Round-trips: 224  (120 long / 104 short)  |  win rate 67.9%  (152W / 72L)
-Net P&L: +25135.30 quote   (gross +9.73 bps/trade, net +4.53 bps/trade after fees)
-Avg win +24.68 bps  |  avg loss -38.03 bps  |  profit factor 1.44
-Max drawdown 1385.78 quote  |  Sharpe(/trade) 0.15  |  avg hold 6.6 ms
-→ Model is net PROFITABLE after fees over this run.
+TRADING SCORECARD  (long&short mean-reversion, ADAPTIVE (entry 1σ/TP 1.5σ/SL 2.5σ), 1x lev, 2.6 bps/side fee)
+Observed price range: [54325.97, 60041.45]  (1052.1 bps span)  |  volatility ~2.61 bps/tick
+Round-trips: 493  (323 long / 170 short)  |  liquidations 0
+Hit rate (signal accuracy, gross): 45.0% (222/493)   |   net-win rate (after fees): 23.1% (114W/379L)
+Capital 10000.00 → equity 8693.06   (-13.07% return on capital)
+Net P&L: -1306.94 quote   (gross -2.43 bps/trade, net -7.63 bps/trade after fees)
+Avg win +1.41 bps  |  avg loss -10.35 bps  |  profit factor 0.04
+Max drawdown 1307.94 quote (13.1%)  |  Sharpe(/trade) -1.02  |  fees 879.71  |  avg hold 18.6 ms
+→ net LOSS after fees over this run.
 ```
 
 **Order flow & leverage.** `HFT_USE_FLOW=1` only takes entries that order flow confirms (buy dips into net buying, short rips into net selling), using signed trade volume (buy +, sell −) from the Kraken feed. Sizing is **capital-based with real leverage**: you set `HFT_CAPITAL` and `HFT_RISK_FRAC` (margin per trade as a fraction of equity), equity compounds across trades, and a position is **liquidated** if it moves ≥ `1/leverage` against you (isolated-margin: you can't lose more than the posted margin). At high leverage a negative net edge compounds into ruin fast — the scorecard reports return on capital, liquidations, max drawdown %, and a `RUINED` flag.
@@ -319,7 +322,7 @@ HFT_TRADE=1 HFT_ADAPTIVE=1 make replay FILE=recordings/two.krkr   # against (mea
 HFT_TRADE=1 HFT_MOMENTUM=1 make live PAIR=XBT/USD   # set HFT_REF_PAIR=ETH/USD
 ```
 
-On a trending tape the difference is stark — going *with* the trend (~59% hit, ~break-even after fees) vs *against* it (~30% hit, deep loss). The JSON exposes `latest_signal_bps`, a `signal_series`, and per-trade `signal_at_entry`. New knobs: `HFT_W_TREND/W_FLOW/W_BASKET/W_LEADLAG`, `HFT_SIGNAL_THR_BPS`, `HFT_PULLBACK_BPS`, `HFT_TRAIL_BPS`, `HFT_REF_PAIR`.
+On a trending tape the difference is directional: going *with* the trend earns a thin **positive gross** edge (+0.2 bps/trade, gross profit factor 1.14 — wins out-size losses) where going *against* it is **negative even before fees** (−2.4 bps/trade, gross PF 0.50). Realistic fees sink both — trend-following just starts on the right side of zero. The JSON exposes `latest_signal_bps`, a `signal_series`, and per-trade `signal_at_entry`. New knobs: `HFT_W_TREND/W_FLOW/W_BASKET/W_LEADLAG`, `HFT_SIGNAL_THR_BPS`, `HFT_PULLBACK_BPS`, `HFT_TRAIL_BPS`, `HFT_REF_PAIR`.
 
 ### Backtest sweep & cost-aware execution
 
