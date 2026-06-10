@@ -481,8 +481,18 @@ fn run_synth(path: &str) -> io::Result<()> {
         let transit = 33_000_000 + (seq.wrapping_mul(2_654_435) % 8_000_000);
         let origin = 1_700_000_000_000_000_000u64.wrapping_add(seq.wrapping_mul(5_000_000));
         // Emit reference (id 1) then traded (id 0), 2.5 ms apart (≈5 ms/round).
+        // Synthetic microstructure: a small spread around mid (≈1.5 bps) and a tiny
+        // slowly-varying funding rate, so offline replay/backtest exercise the v4
+        // fields deterministically. Funding only meaningful for the traded perp.
+        let funding = (0.000_01 * (seq as f64 * 0.01).sin()) as f32;
         for (price, vol, id) in [(ref_price, ref_vol, 1u8), (traded_price, traded_vol, 0u8)] {
-            let pkt = build_packet(price as f32, vol, seq, origin, transit, id);
+            let half = (price * 0.000_075) as f32;         // ≈0.75 bps each side → ~1.5 bps spread
+            let bid = price as f32 - half;
+            let ask = price as f32 + half;
+            let pkt = build_packet_v4(
+                price as f32, vol, seq, origin, transit, id,
+                bid, ask, price as f32, if id == 0 { funding } else { 0.0 },
+            );
             rec.file.write_all(&2_500_000u64.to_le_bytes())?;
             rec.file.write_all(&(pkt.len() as u16).to_le_bytes())?;
             rec.file.write_all(&pkt)?;
