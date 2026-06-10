@@ -1044,6 +1044,9 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
 
     let lo = f32::from_bits(order_book.price_lo_bits.load(Ordering::Relaxed));
     let hi = f32::from_bits(order_book.price_hi_bits.load(Ordering::Relaxed));
+    let spread_lo = f32::from_bits(order_book.spread_lo_bits.load(Ordering::Relaxed));
+    let spread_hi = f32::from_bits(order_book.spread_hi_bits.load(Ordering::Relaxed));
+    let funding   = f32::from_bits(order_book.funding_bits.load(Ordering::Relaxed));
 
     // ── Trading scorecard (HFT_TRADE) ───────────────────────────────────
     if order_book.trade_cfg.enabled {
@@ -1071,6 +1074,10 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
             let range_bps = if lo > 0.0 { (hi - lo) / lo * 10_000.0 } else { 0.0 };
             println!("Observed price range: [{:.2}, {:.2}]  ({:.1} bps span)  |  volatility ~{:.2} bps/tick",
                      lo, hi, range_bps, vol);
+            if spread_lo.is_finite() && spread_hi.is_finite() {
+                println!("Market data: spread {:.2}–{:.2} bps  |  funding {:.6}% (latest)",
+                         spread_lo, spread_hi, funding * 100.0);
+            }
         }
         match scorecard(rts, cfg.capital as f64) {
             Some(s) => {
@@ -1130,6 +1137,10 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
     if lo.is_finite() && hi.is_finite() {
         let range_bps = if lo > 0.0 { (hi - lo) / lo * 10_000.0 } else { 0.0 };
         println!("Observed price range: [{:.4}, {:.4}]  ({:.2} bps span)", lo, hi, range_bps);
+        if spread_lo.is_finite() && spread_hi.is_finite() {
+            println!("Market data: spread {:.2}–{:.2} bps  |  funding {:.6}% (latest)",
+                     spread_lo, spread_hi, funding * 100.0);
+        }
         if attempts == 0 {
             println!("  → no buys triggered. The market moved only {:.2} bps this run; try", range_bps);
             println!("    a smaller HFT_TARGET_DIP_BPS, HFT_DOWNTICK=1, a busier pair, or a longer run.");
@@ -1289,6 +1300,15 @@ fn write_log(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
     } else {
         json.push_str("  \"price_range\": null,\n");
     }
+    let spread_lo = f32::from_bits(order_book.spread_lo_bits.load(Ordering::Relaxed));
+    let spread_hi = f32::from_bits(order_book.spread_hi_bits.load(Ordering::Relaxed));
+    let funding   = f32::from_bits(order_book.funding_bits.load(Ordering::Relaxed));
+    if spread_lo.is_finite() && spread_hi.is_finite() {
+        json.push_str(&format!("  \"spread_bps\": {{\"min\": {}, \"max\": {}}},\n", spread_lo, spread_hi));
+    } else {
+        json.push_str("  \"spread_bps\": null,\n");
+    }
+    json.push_str(&format!("  \"funding_rate\": {},\n", funding));
     match summarize_slippage(slippage_bps_samples(&trades[..count])) {
         Some(s) => {
             json.push_str("  \"slippage_bps\": {\n");
