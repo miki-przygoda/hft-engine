@@ -254,6 +254,9 @@ pub(crate) struct OrderBook {
     pub(crate) filled:        AtomicU64,        // attempts whose simulated fill resolved (sole writer: strategy)
     pub(crate) price_lo_bits: AtomicU32,        // min observed price (f32 bits); sole writer: ingestor
     pub(crate) price_hi_bits: AtomicU32,        // max observed price (f32 bits); sole writer: ingestor
+    pub(crate) spread_lo_bits: AtomicU32,       // min observed spread (f32 bps bits); sole writer: ingestor
+    pub(crate) spread_hi_bits: AtomicU32,       // max observed spread (f32 bps bits); sole writer: ingestor
+    pub(crate) funding_bits:   AtomicU32,       // latest funding rate (f32 bits); sole writer: ingestor
     // Target-price buy level, set once by main from HFT_TARGET_PRICE. 0.0 = breakout mode.
     pub(crate) target_price:  f32,
     // Relative-dip threshold in bps (HFT_TARGET_DIP_BPS). >0 = buy on a dip of this
