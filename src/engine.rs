@@ -321,6 +321,25 @@ pub(crate) fn run_ingestor(
                             order_book.price_hi_bits.store(px.to_bits(), Ordering::Relaxed);
                         }
                     }
+                    // v4: observed spread (bps) + latest funding from bid/ask/funding.
+                    if amt >= 49 {
+                        let bid = f32::from_le_bytes(pkt[33..37].try_into().unwrap());
+                        let ask = f32::from_le_bytes(pkt[37..41].try_into().unwrap());
+                        let m = (bid + ask) / 2.0;
+                        if m > 0.0 && bid > 0.0 && ask >= bid {
+                            let sp = (ask - bid) / m * 10_000.0;  // spread in bps
+                            if sp < f32::from_bits(order_book.spread_lo_bits.load(Ordering::Relaxed)) {
+                                order_book.spread_lo_bits.store(sp.to_bits(), Ordering::Relaxed);
+                            }
+                            if sp > f32::from_bits(order_book.spread_hi_bits.load(Ordering::Relaxed)) {
+                                order_book.spread_hi_bits.store(sp.to_bits(), Ordering::Relaxed);
+                            }
+                        }
+                        let funding = f32::from_le_bytes(pkt[45..49].try_into().unwrap());
+                        if funding.is_finite() {
+                            order_book.funding_bits.store(funding.to_bits(), Ordering::Relaxed);
+                        }
+                    }
                 }
 
                 let s = seq[id];
@@ -342,6 +361,18 @@ pub(crate) fn run_ingestor(
                     } else {
                         *(tick_ptr.add(24) as *mut u64) = 0;
                         *(tick_ptr.add(32) as *mut u64) = 0;
+                    }
+                    // v4 packets (>= 49 bytes) carry bid/ask/mark/funding at [33..49].
+                    if amt >= 49 {
+                        *(tick_ptr.add(40) as *mut f32) = f32::from_le_bytes(pkt[33..37].try_into().unwrap());
+                        *(tick_ptr.add(44) as *mut f32) = f32::from_le_bytes(pkt[37..41].try_into().unwrap());
+                        *(tick_ptr.add(48) as *mut f32) = f32::from_le_bytes(pkt[41..45].try_into().unwrap());
+                        *(tick_ptr.add(52) as *mut f32) = f32::from_le_bytes(pkt[45..49].try_into().unwrap());
+                    } else {
+                        *(tick_ptr.add(40) as *mut f32) = 0.0;
+                        *(tick_ptr.add(44) as *mut f32) = 0.0;
+                        *(tick_ptr.add(48) as *mut f32) = 0.0;
+                        *(tick_ptr.add(52) as *mut f32) = 0.0;
                     }
                 }
 
