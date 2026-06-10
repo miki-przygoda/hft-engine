@@ -276,6 +276,42 @@ fn parse_kraken_ts(s: &str) -> Option<u64> {
     Some(sec.wrapping_mul(1_000_000_000).wrapping_add(frac_ns))
 }
 
+// ── Kraken Futures ticker parsing ─────────────────────────────────────────────
+
+/// Extract the JSON number that follows `"key":` in `msg` (handles integers,
+/// decimals, and scientific notation). `None` if the key is absent or the value
+/// is not a bare number (e.g. a string). Good enough for Kraken's flat ticker
+/// objects — not a general JSON parser.
+fn json_num(msg: &str, key: &str) -> Option<f64> {
+    let pat = format!("\"{key}\":");
+    let start = msg.find(&pat)? + pat.len();
+    let rest = msg[start..].trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')))
+        .unwrap_or(rest.len());
+    rest[..end].parse::<f64>().ok()
+}
+
+/// Parse a Kraken **Futures** public `ticker` message → `(bid, ask, mark_price,
+/// funding_rate, origin_ts_ns)`. The feed is a flat JSON object with `bid`, `ask`,
+/// `markPrice`, `funding_rate` (omitted when zero → defaulted to 0.0), and `time`
+/// (ms since epoch). Returns `None` for any frame that is not a populated ticker
+/// (subscription acks, heartbeats, or missing bid/ask).
+fn parse_futures_ticker(msg: &str) -> Option<(f32, f32, f32, f32, u64)> {
+    if !msg.contains("\"feed\":\"ticker\"") || !msg.contains("\"bid\":") {
+        return None;
+    }
+    let bid = json_num(msg, "bid")? as f32;
+    let ask = json_num(msg, "ask")? as f32;
+    if !(bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0) {
+        return None;
+    }
+    let mark = json_num(msg, "markPrice").map(|v| v as f32).unwrap_or((bid + ask) / 2.0);
+    let funding = json_num(msg, "funding_rate").map(|v| v as f32).unwrap_or(0.0);
+    let origin_ns = json_num(msg, "time").map(|ms| (ms as u64).wrapping_mul(1_000_000)).unwrap_or(0);
+    Some((bid, ask, mark, funding, origin_ns))
+}
+
 // ── WebSocket handshake ───────────────────────────────────────────────────────
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -804,5 +840,38 @@ mod tests {
         assert_eq!(f32::from_le_bytes(p[37..41].try_into().unwrap()), 60005.0);
         assert_eq!(f32::from_le_bytes(p[41..45].try_into().unwrap()), 60001.0);
         assert_eq!(f32::from_le_bytes(p[45..49].try_into().unwrap()), 1.2e-7);
+    }
+
+    #[test]
+    fn json_num_extracts_numbers() {
+        let m = r#"{"a":12.5,"b":-3,"c":1.2e-7,"d":"x"}"#;
+        assert_eq!(json_num(m, "a"), Some(12.5));
+        assert_eq!(json_num(m, "b"), Some(-3.0));
+        assert_eq!(json_num(m, "c"), Some(1.2e-7));
+        assert_eq!(json_num(m, "missing"), None);
+    }
+
+    #[test]
+    fn parse_futures_ticker_message() {
+        let msg = r#"{"feed":"ticker","product_id":"PF_XBTUSD","bid":60234.0,"ask":60235.5,"markPrice":60234.8,"last":60234.5,"funding_rate":1.2e-7,"time":1718040000000}"#;
+        let t = parse_futures_ticker(msg).expect("a ticker");
+        assert!((t.0 - 60234.0).abs() < 0.01);   // bid
+        assert!((t.1 - 60235.5).abs() < 0.01);   // ask
+        assert!((t.2 - 60234.8).abs() < 0.01);   // mark
+        assert!((t.3 - 1.2e-7).abs() < 1e-12);   // funding
+        assert_eq!(t.4, 1_718_040_000_000_000_000); // time ms → ns
+    }
+
+    #[test]
+    fn parse_futures_ticker_absent_funding_is_zero() {
+        let msg = r#"{"feed":"ticker","product_id":"PF_XBTUSD","bid":60234.0,"ask":60235.5,"markPrice":60234.8,"time":1718040000000}"#;
+        let t = parse_futures_ticker(msg).expect("a ticker");
+        assert_eq!(t.3, 0.0);                    // funding omitted → 0.0
+    }
+
+    #[test]
+    fn parse_futures_ticker_non_ticker_is_none() {
+        assert!(parse_futures_ticker(r#"{"event":"subscribed","feed":"ticker"}"#).is_none());
+        assert!(parse_futures_ticker(r#"{"feed":"heartbeat"}"#).is_none());
     }
 }
