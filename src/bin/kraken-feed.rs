@@ -330,10 +330,10 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Perform the WebSocket opening handshake. Returns any bytes already read past
 /// the response headers (the start of the frame stream).
-fn ws_handshake(stream: &mut TcpStream, host: &str) -> io::Result<Vec<u8>> {
+fn ws_handshake(stream: &mut TcpStream, host: &str, path: &str) -> io::Result<Vec<u8>> {
     let key = base64_encode(&random_bytes(16));
     let req = format!(
-        "GET / HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nOrigin: https://{host}\r\n\r\n"
     );
     stream.write_all(req.as_bytes())?;
@@ -624,7 +624,7 @@ fn run_live(
     println!("[kraken-feed] connecting to {endpoint} (stunnel → {KRAKEN_HOST}:443)");
     let mut stream = TcpStream::connect(endpoint)?;
     stream.set_nodelay(true).ok();
-    let mut acc = ws_handshake(&mut stream, KRAKEN_HOST)?;
+    let mut acc = ws_handshake(&mut stream, KRAKEN_HOST, "/")?;
     println!("[kraken-feed] websocket connected; subscribing to {pair} (0) + {ref_pair} (1) trades");
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
 
@@ -707,7 +707,7 @@ fn run_futures(
     println!("[kraken-feed] connecting to {endpoint} (stunnel → {KRAKEN_FUTURES_HOST}:443)");
     let mut stream = TcpStream::connect(endpoint)?;
     stream.set_nodelay(true).ok();
-    let mut acc = ws_handshake(&mut stream, KRAKEN_FUTURES_HOST)?;
+    let mut acc = ws_handshake(&mut stream, KRAKEN_FUTURES_HOST, "/ws/v1")?;
     println!("[kraken-feed] websocket connected; subscribing to futures ticker {product}");
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
 
@@ -738,8 +738,8 @@ fn run_futures(
                     let msg = String::from_utf8_lossy(&payload);
                     if let Some((bid, ask, mark, funding, origin_ns)) = parse_futures_ticker(&msg) {
                         if first {
-                            println!("[kraken-feed] first ticker: mid {:.1}  spread {:.3} bps  funding {:.6}%",
-                                     mid(bid, ask), spread_bps(bid, ask), funding * 100.0);
+                            println!("[kraken-feed] first ticker: mid {:.1}  spread {:.3} bps  funding {:.8} (raw)",
+                                     mid(bid, ask), spread_bps(bid, ask), funding);
                             first = false;
                         }
                         let pkt = build_packet_v4(
