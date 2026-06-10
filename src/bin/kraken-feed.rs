@@ -669,12 +669,10 @@ fn run_live(
                     }
                 }
                 0x9 => { stream.write_all(&build_frame(0xA, &payload))?; } // ping → pong
-                0xA => {
-                    if payload.len() >= 8 {
-                        let sent = u64::from_le_bytes(payload[..8].try_into().unwrap());
-                        let rtt = (start.elapsed().as_nanos() as u64).saturating_sub(sent);
-                        transit_est = rtt / 2;
-                    }
+                0xA if payload.len() >= 8 => {
+                    let sent = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                    let rtt = (start.elapsed().as_nanos() as u64).saturating_sub(sent);
+                    transit_est = rtt / 2;
                 }
                 0x8 => { println!("[kraken-feed] server closed connection"); return Ok(()); }
                 _ => {}
@@ -754,12 +752,10 @@ fn run_futures(
                     }
                 }
                 0x9 => { stream.write_all(&build_frame(0xA, &payload))?; }
-                0xA => {
-                    if payload.len() >= 8 {
-                        let sent = u64::from_le_bytes(payload[..8].try_into().unwrap());
-                        let rtt = (start.elapsed().as_nanos() as u64).saturating_sub(sent);
-                        transit_est = rtt / 2;
-                    }
+                0xA if payload.len() >= 8 => {
+                    let sent = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                    let rtt = (start.elapsed().as_nanos() as u64).saturating_sub(sent);
+                    transit_est = rtt / 2;
                 }
                 0x8 => { println!("[kraken-feed] server closed connection"); return Ok(()); }
                 _ => {}
