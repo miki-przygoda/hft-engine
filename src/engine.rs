@@ -1676,7 +1676,10 @@ pub(crate) unsafe fn trading_strategy(
                     while p_head != p_tail {
                         if tick_now_ns >= pend_due[p_head & PMASK] {
                             let fslot = pend_slot[p_head & PMASK];
-                            (*order_book.trade_log.entries.get())[fslot].fill_price = price;
+                            // One-sided buys cross the spread to the ask (SP2); falls
+                            // back to mid when this tick carries no quote (non-v4 feed).
+                            (*order_book.trade_log.entries.get())[fslot].fill_price =
+                                crate::model::taker_fill(price, tick_ptr.bid, tick_ptr.ask, true, order_book.trade_cfg.slippage_bps);
                             order_book.filled.fetch_add(1, Ordering::Relaxed);
                             p_head += 1;
                         } else {
