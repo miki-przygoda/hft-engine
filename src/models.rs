@@ -202,7 +202,8 @@ pub(crate) struct TradeCfg {
 pub(crate) struct RoundTrip {
     pub entry_time_ns: u64,
     pub exit_time_ns:  u64,
-    pub hold_ns:       u64,
+    pub spread_cost_bps: f32, // SP2: spread+slippage cost vs mid-to-mid (bps). Hold
+                              // time is derived as exit_time_ns - entry_time_ns.
     pub side:          i64,   // +1 long, -1 short
     pub entry_price:   f32,
     pub exit_price:    f32,

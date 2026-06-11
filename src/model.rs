@@ -109,7 +109,8 @@ pub(crate) struct AlphaModel {
     feat_scale: [f32; N_FEATURES],
     // Position / capital.
     pub(crate) pos_side: i64, // 0 flat, +1 long, -1 short
-    entry_price: f32,
+    entry_price: f32,         // adverse entry fill (ask for long, bid for short)
+    entry_mid: f32,           // mid at entry, for the spread-cost accounting
     entry_time: u64,
     pos_size: f32,
     entry_margin: f64,
@@ -129,7 +130,7 @@ impl AlphaModel {
             vol_ema: 0.0, vol_prev: 0.0, vol_init: false,
             scale_trend: 1.0, scale_basket: 1.0, scale_leadlag: 1.0,
             policy, feat_scale: [1.0; N_FEATURES],
-            pos_side: 0, entry_price: 0.0, entry_time: 0, pos_size: 0.0,
+            pos_side: 0, entry_price: 0.0, entry_mid: 0.0, entry_time: 0, pos_size: 0.0,
             entry_margin: 0.0, best_price: 0.0,
             equity: cfg.capital as f64, ruined: false, latest_signal: 0.0,
         }
@@ -240,6 +241,7 @@ impl AlphaModel {
             let notional = self.entry_margin * self.cfg.leverage as f64;
             // Cross the spread on entry: a long buys the ask, a short sells the bid.
             self.entry_price = taker_fill(price, bid, ask, dir == 1, self.cfg.slippage_bps);
+            self.entry_mid  = price;
             self.pos_size   = (notional / self.entry_price as f64) as f32;
             self.entry_time = now_ns;
             self.pos_side = dir;
@@ -277,10 +279,13 @@ impl AlphaModel {
             if self.equity <= 0.0 { self.equity = 0.0; self.ruined = true; }
             let side = self.pos_side;
             self.pos_side = 0;
+            // Spread+slippage cost = the mid-to-mid "ideal" move minus the realized
+            // fill-to-fill gross. Positive = the spread/slippage ate this many bps.
+            let ideal_gross = ((price - self.entry_mid) / self.entry_mid * 10_000.0 * side as f32) as f64;
             Decision::Exit(RoundTrip {
                 entry_time_ns: self.entry_time,
                 exit_time_ns: now_ns,
-                hold_ns: now_ns.saturating_sub(self.entry_time),
+                spread_cost_bps: (ideal_gross - gross_bps) as f32,
                 side,
                 entry_price: self.entry_price,
                 exit_price: exit_fill,
