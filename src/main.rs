@@ -80,6 +80,10 @@ fn main() {
         fee_gate:       std::env::var_os("HFT_FEE_GATE").is_some(),
         min_edge_bps:   env_f32("HFT_MIN_EDGE_BPS", rust_hft_software::config::MIN_EDGE_BPS_DEFAULT),
         normalize:      std::env::var_os("HFT_NORMALIZE").is_some(),
+        slippage_bps:   env_f32("HFT_SLIPPAGE_BPS", rust_hft_software::config::SLIPPAGE_BPS_DEFAULT),
+        funding_bps_per_hr: env_f32("HFT_FUNDING_BPS_PER_HR", rust_hft_software::config::FUNDING_BPS_PER_HR_DEFAULT),
+        vol_target_bps:    env_f32("HFT_VOL_TARGET_BPS",    rust_hft_software::config::VOL_TARGET_BPS_DEFAULT),
+        max_exposure_mult: env_f32("HFT_MAX_EXPOSURE_MULT", rust_hft_software::config::MAX_EXPOSURE_MULT_DEFAULT),
     };
 
     if trade_cfg.enabled && trade_cfg.momentum {
@@ -106,6 +110,26 @@ fn main() {
         println!("[engine] dip mode: buy on a {target_dip_bps} bps dip below the rolling reference");
     } else if target_price > 0.0 {
         println!("[engine] target-price mode: buy when price ≤ {target_price}");
+    }
+
+    // Perpetual cost stack (SP2–SP5): only echo the knobs that are actually engaged,
+    // so a plain run stays quiet but a cost-aware run is self-documenting.
+    if trade_cfg.slippage_bps != 0.0 || trade_cfg.funding_bps_per_hr != 0.0
+        || trade_cfg.vol_target_bps != 0.0 || trade_cfg.max_exposure_mult != 0.0 {
+        let mut parts: Vec<String> = Vec::new();
+        if trade_cfg.slippage_bps != 0.0 {
+            parts.push(format!("slippage {:.2}bps", trade_cfg.slippage_bps));
+        }
+        if trade_cfg.funding_bps_per_hr != 0.0 {
+            parts.push(format!("funding {:.2}bps/hr", trade_cfg.funding_bps_per_hr));
+        }
+        if trade_cfg.vol_target_bps != 0.0 {
+            parts.push(format!("vol-target {:.1}bps (size↓ as σ↑)", trade_cfg.vol_target_bps));
+        }
+        if trade_cfg.max_exposure_mult != 0.0 {
+            parts.push(format!("exposure ≤ {:.1}×equity", trade_cfg.max_exposure_mult));
+        }
+        println!("[engine] cost stack: {}", parts.join("  "));
     }
 
     let args: Vec<String> = std::env::args().collect();
@@ -175,6 +199,7 @@ fn main() {
         spread_lo_bits: AtomicU32::new(f32::INFINITY.to_bits()),
         spread_hi_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
         funding_bits:   AtomicU32::new(0f32.to_bits()),
+        funding_quote_bits: AtomicU64::new(0f64.to_bits()),
         target_price,
         target_dip_bps,
         buy_on_downtick,

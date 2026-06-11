@@ -124,6 +124,15 @@ pub mod config {
     // Fee-aware entry gate (HFT_FEE_GATE=1): require expected move ≥ round-trip
     // cost + this buffer before entering. Kills structurally-doomed trades.
     pub const MIN_EDGE_BPS_DEFAULT: f32 = 0.0;
+    // Realistic fills (SP2): extra adverse slippage in bps on top of the crossed
+    // bid/ask spread (HFT_SLIPPAGE_BPS). 0 = spread only.
+    pub const SLIPPAGE_BPS_DEFAULT: f32 = 0.0;
+    // Funding (SP3): manual relative funding-rate override (bps/hr) for offline
+    // testing; 0 = use the feed's per-tick relative_funding_rate.
+    pub const FUNDING_BPS_PER_HR_DEFAULT: f32 = 0.0;
+    // Smarter sizing (SP5), both opt-in / 0 = current conviction sizing.
+    pub const VOL_TARGET_BPS_DEFAULT:    f32 = 0.0;  // size so the stop risks ~this many bps of equity
+    pub const MAX_EXPOSURE_MULT_DEFAULT: f32 = 0.0;  // hard cap on notional / equity (0 = uncapped)
 
     // ── Learned policy (HFT_MODEL / --train) ─────────────────────────────────
     // A tiny MLP (6→8→1, 65 f32 weights — see model::Policy) supplies the signal

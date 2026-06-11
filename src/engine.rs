@@ -584,6 +584,11 @@ struct Scorecard {
     gross_bps_mean: f64, net_bps_mean: f64,
     avg_win_bps: f64, avg_loss_bps: f64,
     profit_factor: f64, max_drawdown: f64, max_dd_pct: f64, sharpe: f64, avg_hold_ms: f64,
+    avg_spread_cost_bps: f64,
+    // SP4 risk metrics.
+    sortino: f64, calmar: f64, time_in_dd_pct: f64, turnover: f64,
+    long_net_bps: f64, long_pnl: f64, long_win_rate: f64,
+    short_net_bps: f64, short_pnl: f64, short_win_rate: f64,
     capital: f64, final_equity: f64, return_pct: f64, ruined: bool,
 }
 
@@ -595,15 +600,34 @@ fn scorecard(rts: &[models::RoundTrip], capital: f64) -> Option<Scorecard> {
     let (mut total_pnl, mut total_fees) = (0.0f64, 0.0f64);
     let (mut gross_sum, mut net_sum) = (0.0f64, 0.0f64);
     let (mut win_bps_sum, mut loss_bps_sum) = (0.0f64, 0.0f64);
-    let (mut win_pnl, mut loss_pnl, mut hold_sum) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut win_pnl, mut loss_pnl, mut hold_sum, mut spread_sum) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let (mut equity, mut peak, mut maxdd, mut min_eq) = (capital, capital, 0.0f64, capital);
     let mut nets: Vec<f64> = Vec::with_capacity(n);
+    // SP4 accumulators.
+    let (mut downside_sq, mut notional_sum) = (0.0f64, 0.0f64);
+    let (mut long_wins, mut short_wins) = (0usize, 0usize);
+    let (mut long_net_sum, mut long_pnl_sum, mut short_net_sum, mut short_pnl_sum) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    // Time-in-drawdown: accumulate wall-time spent below the prior equity peak.
+    let (mut underwater_time, mut last_exit_t, mut last_underwater, mut have_prev) = (0.0f64, 0.0f64, false, false);
+    let first_exit_t = rts[0].exit_time_ns as f64;
     for t in rts {
         let net = t.net_bps as f64;
         net_sum += net; gross_sum += t.gross_bps as f64;
         total_pnl += t.pnl_quote as f64; total_fees += t.fees_quote as f64;
-        hold_sum += t.hold_ns as f64;
-        if t.side > 0 { longs += 1; } else { shorts += 1; }
+        hold_sum += t.exit_time_ns.saturating_sub(t.entry_time_ns) as f64;
+        spread_sum += t.spread_cost_bps as f64;
+        downside_sq += net.min(0.0).powi(2);
+        notional_sum += t.size as f64 * t.entry_price as f64;
+        // The gap up to this exit was spent at the previous equity state.
+        let exit_t = t.exit_time_ns as f64;
+        if have_prev && last_underwater { underwater_time += exit_t - last_exit_t; }
+        if t.side > 0 {
+            longs += 1; long_net_sum += net; long_pnl_sum += t.pnl_quote as f64;
+            if net > 0.0 { long_wins += 1; }
+        } else {
+            shorts += 1; short_net_sum += net; short_pnl_sum += t.pnl_quote as f64;
+            if net > 0.0 { short_wins += 1; }
+        }
         if t.flags >= 0.5 { liquidations += 1; }
         if t.gross_bps > 0.0 { gross_wins += 1; }   // signal accuracy (before fees)
         if net > 0.0 { wins += 1; win_bps_sum += net; win_pnl += t.pnl_quote as f64; }
@@ -613,10 +637,17 @@ fn scorecard(rts: &[models::RoundTrip], capital: f64) -> Option<Scorecard> {
         if equity > peak { peak = equity; }
         if peak - equity > maxdd { maxdd = peak - equity; }
         if equity < min_eq { min_eq = equity; }
+        last_underwater = equity < peak;
+        last_exit_t = exit_t;
+        have_prev = true;
     }
     let mean = net_sum / n as f64;
     let std = (nets.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64).sqrt();
+    let downside_dev = (downside_sq / n as f64).sqrt();
     let final_equity = (capital + total_pnl).max(0.0);
+    let return_pct = (final_equity - capital) / capital * 100.0;
+    let max_dd_pct = if peak > 0.0 { maxdd / peak * 100.0 } else { 0.0 };
+    let total_time = (last_exit_t - first_exit_t).max(0.0);
     Some(Scorecard {
         n, wins, losses, longs, shorts, liquidations,
         gross_wins, hit_rate: gross_wins as f64 / n as f64 * 100.0,
@@ -627,11 +658,20 @@ fn scorecard(rts: &[models::RoundTrip], capital: f64) -> Option<Scorecard> {
         avg_loss_bps: if losses > 0 { loss_bps_sum / losses as f64 } else { 0.0 },
         profit_factor: if loss_pnl < 0.0 { win_pnl / -loss_pnl }
                        else if win_pnl > 0.0 { f64::INFINITY } else { 0.0 },
-        max_drawdown: maxdd,
-        max_dd_pct: if peak > 0.0 { maxdd / peak * 100.0 } else { 0.0 },
+        max_drawdown: maxdd, max_dd_pct,
         sharpe: if std > 0.0 { mean / std } else { 0.0 },
-        avg_hold_ms: hold_sum / n as f64 / 1e6,
-        capital, final_equity, return_pct: (final_equity - capital) / capital * 100.0,
+        avg_hold_ms: hold_sum / n as f64 / 1e6, avg_spread_cost_bps: spread_sum / n as f64,
+        sortino: if downside_dev > 0.0 { mean / downside_dev } else { 0.0 },
+        calmar: if max_dd_pct > 0.0 { return_pct / max_dd_pct } else { 0.0 },
+        time_in_dd_pct: if total_time > 0.0 { underwater_time / total_time * 100.0 } else { 0.0 },
+        turnover: notional_sum / capital,
+        long_net_bps:  if longs  > 0 { long_net_sum  / longs  as f64 } else { 0.0 },
+        long_pnl: long_pnl_sum,
+        long_win_rate: if longs  > 0 { long_wins  as f64 / longs  as f64 * 100.0 } else { 0.0 },
+        short_net_bps: if shorts > 0 { short_net_sum / shorts as f64 } else { 0.0 },
+        short_pnl: short_pnl_sum,
+        short_win_rate: if shorts > 0 { short_wins as f64 / shorts as f64 * 100.0 } else { 0.0 },
+        capital, final_equity, return_pct,
         ruined: min_eq <= 0.0,
     })
 }
@@ -641,7 +681,7 @@ fn scorecard(rts: &[models::RoundTrip], capital: f64) -> Option<Scorecard> {
 // in-sample/out-of-sample split and a small parameter grid, ranked by OOS return.
 
 #[derive(Copy, Clone)]
-struct BtTick { id: u8, price: f32, vol: f32, t_ns: u64 }
+struct BtTick { id: u8, price: f32, vol: f32, t_ns: u64, bid: f32, ask: f32, mark: f32, funding: f32 }
 
 fn load_capture(path: &str) -> std::io::Result<Vec<BtTick>> {
     let data = std::fs::read(path)?;
@@ -663,6 +703,11 @@ fn load_capture(path: &str) -> std::io::Result<Vec<BtTick>> {
             price: f32::from_le_bytes(pkt[0..4].try_into().unwrap()),
             vol:   f32::from_le_bytes(pkt[4..8].try_into().unwrap()),
             t_ns:  t,
+            // v4 packets (>= 49 bytes) carry bid/ask at [33..41]; older packets 0.
+            bid:   if len >= 49 { f32::from_le_bytes(pkt[33..37].try_into().unwrap()) } else { 0.0 },
+            ask:   if len >= 49 { f32::from_le_bytes(pkt[37..41].try_into().unwrap()) } else { 0.0 },
+            mark:  if len >= 49 { f32::from_le_bytes(pkt[41..45].try_into().unwrap()) } else { 0.0 },
+            funding: if len >= 49 { f32::from_le_bytes(pkt[45..49].try_into().unwrap()) } else { 0.0 },
         });
     }
     Ok(out)
@@ -682,7 +727,7 @@ fn run_model(
         seq += 1;
         let warmed = seq > WARMUP_PACKETS;
         if let crate::model::Decision::Exit(rt) =
-            model.on_traded_tick(tk.price, tk.vol, tk.t_ns, warmed, false)
+            model.on_traded_tick(tk.price, tk.bid, tk.ask, tk.mark, tk.funding, tk.vol, tk.t_ns, warmed, false)
         {
             rts.push(rt);
         }
@@ -1075,8 +1120,8 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
             println!("Observed price range: [{:.2}, {:.2}]  ({:.1} bps span)  |  volatility ~{:.2} bps/tick",
                      lo, hi, range_bps, vol);
             if spread_lo.is_finite() && spread_hi.is_finite() {
-                println!("Market data: spread {:.2}–{:.2} bps  |  funding {:.6}% (latest)",
-                         spread_lo, spread_hi, funding * 100.0);
+                println!("Market data: spread {:.2}–{:.2} bps  |  funding {:.8}/hr (relative, latest)",
+                         spread_lo, spread_hi, funding);
             }
         }
         match scorecard(rts, cfg.capital as f64) {
@@ -1091,8 +1136,16 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
                          s.total_pnl, s.gross_bps_mean, s.net_bps_mean);
                 println!("Avg win {:+.2} bps  |  avg loss {:+.2} bps  |  profit factor {:.2}",
                          s.avg_win_bps, s.avg_loss_bps, s.profit_factor);
-                println!("Max drawdown {:.2} quote ({:.1}%)  |  Sharpe(/trade) {:.2}  |  fees {:.2}  |  avg hold {:.1} ms",
-                         s.max_drawdown, s.max_dd_pct, s.sharpe, s.total_fees, s.avg_hold_ms);
+                println!("Max drawdown {:.2} quote ({:.1}%)  |  Sharpe(/trade) {:.2}  |  fees {:.2}  |  spread cost {:.2} bps/trade  |  avg hold {:.1} ms",
+                         s.max_drawdown, s.max_dd_pct, s.sharpe, s.total_fees, s.avg_spread_cost_bps, s.avg_hold_ms);
+                let funding_total = f64::from_bits(order_book.funding_quote_bits.load(Ordering::Relaxed));
+                println!("Funding: {:+.4} quote total  ({:+.6} quote/trade)  — a per-hour cost, ≈0 at ms holds; scales with hold time",
+                         funding_total, funding_total / s.n as f64);
+                println!("Risk: Sortino {:.2}  |  Calmar {:.2}  |  time-in-drawdown {:.1}%  |  turnover {:.1}x capital",
+                         s.sortino, s.calmar, s.time_in_dd_pct, s.turnover);
+                println!("By side: LONG {} net {:+.2} bps  {:.1}% win  {:+.2} quote   |   SHORT {} net {:+.2} bps  {:.1}% win  {:+.2} quote",
+                         s.longs,  s.long_net_bps,  s.long_win_rate,  s.long_pnl,
+                         s.shorts, s.short_net_bps, s.short_win_rate, s.short_pnl);
                 let verdict = if s.ruined { "BLOWN UP (account ruined)" }
                               else if s.return_pct > 0.0 { "net PROFITABLE" } else { "net LOSS" };
                 println!("→ {verdict} after fees over this run.");
@@ -1138,8 +1191,8 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
         let range_bps = if lo > 0.0 { (hi - lo) / lo * 10_000.0 } else { 0.0 };
         println!("Observed price range: [{:.4}, {:.4}]  ({:.2} bps span)", lo, hi, range_bps);
         if spread_lo.is_finite() && spread_hi.is_finite() {
-            println!("Market data: spread {:.2}–{:.2} bps  |  funding {:.6}% (latest)",
-                     spread_lo, spread_hi, funding * 100.0);
+            println!("Market data: spread {:.2}–{:.2} bps  |  funding {:.8}/hr (relative, latest)",
+                     spread_lo, spread_hi, funding);
         }
         if attempts == 0 {
             println!("  → no buys triggered. The market moved only {:.2} bps this run; try", range_bps);
@@ -1355,8 +1408,13 @@ fn write_log(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
                 json.push_str(&format!("    \"gross_bps_mean\": {:.4}, \"net_bps_mean\": {:.4}, \"avg_win_bps\": {:.4}, \"avg_loss_bps\": {:.4},\n",
                     s.gross_bps_mean, s.net_bps_mean, s.avg_win_bps, s.avg_loss_bps));
                 let pf = if s.profit_factor.is_finite() { format!("{:.4}", s.profit_factor) } else { "null".to_string() };
-                json.push_str(&format!("    \"profit_factor\": {}, \"max_drawdown_quote\": {:.4}, \"max_dd_pct\": {:.4}, \"sharpe_per_trade\": {:.4}, \"avg_hold_ms\": {:.3}\n",
-                    pf, s.max_drawdown, s.max_dd_pct, s.sharpe, s.avg_hold_ms));
+                json.push_str(&format!("    \"funding_quote\": {:.4},\n", f64::from_bits(order_book.funding_quote_bits.load(Ordering::Relaxed))));
+                json.push_str(&format!("    \"sortino\": {:.4}, \"calmar\": {:.4}, \"time_in_dd_pct\": {:.4}, \"turnover\": {:.4},\n",
+                    s.sortino, s.calmar, s.time_in_dd_pct, s.turnover));
+                json.push_str(&format!("    \"long_net_bps\": {:.4}, \"long_pnl_quote\": {:.4}, \"long_win_rate\": {:.4}, \"short_net_bps\": {:.4}, \"short_pnl_quote\": {:.4}, \"short_win_rate\": {:.4},\n",
+                    s.long_net_bps, s.long_pnl, s.long_win_rate, s.short_net_bps, s.short_pnl, s.short_win_rate));
+                json.push_str(&format!("    \"profit_factor\": {}, \"max_drawdown_quote\": {:.4}, \"max_dd_pct\": {:.4}, \"sharpe_per_trade\": {:.4}, \"avg_spread_cost_bps\": {:.4}, \"avg_hold_ms\": {:.3}\n",
+                    pf, s.max_drawdown, s.max_dd_pct, s.sharpe, s.avg_spread_cost_bps, s.avg_hold_ms));
             }
             None => json.push_str("    \"round_trips\": 0\n"),
         }
@@ -1376,8 +1434,8 @@ fn write_log(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
         for (i, t) in rts.iter().enumerate() {
             let comma = if i + 1 < rt_count { "," } else { "" };
             json.push_str(&format!(
-                "    {{\"side\": {}, \"entry_price\": {}, \"exit_price\": {}, \"size\": {}, \"gross_bps\": {:.4}, \"net_bps\": {:.4}, \"pnl_quote\": {:.4}, \"hold_ns\": {}, \"signal_at_entry\": {:.4}}}{}\n",
-                t.side, t.entry_price, t.exit_price, t.size, t.gross_bps, t.net_bps, t.pnl_quote, t.hold_ns, sig_at_entry[i], comma));
+                "    {{\"side\": {}, \"entry_price\": {}, \"exit_price\": {}, \"size\": {}, \"gross_bps\": {:.4}, \"net_bps\": {:.4}, \"pnl_quote\": {:.4}, \"hold_ns\": {}, \"spread_cost_bps\": {:.4}, \"signal_at_entry\": {:.4}}}{}\n",
+                t.side, t.entry_price, t.exit_price, t.size, t.gross_bps, t.net_bps, t.pnl_quote, t.exit_time_ns.saturating_sub(t.entry_time_ns), t.spread_cost_bps, sig_at_entry[i], comma));
         }
         json.push_str("  ],\n");
 
@@ -1571,6 +1629,9 @@ pub(crate) unsafe fn trading_strategy(
         const RT_MASK: usize = ROUND_TRIP_LOG_SIZE - 1;
         let mut pos_side:    i64 = 0;    // 0 flat, +1 long, -1 short
         let mut entry_price: f32 = 0.0;
+        let mut entry_mid:   f32 = 0.0;  // mid at entry, for the SP2 spread-cost accounting
+        let mut entry_funding: f32 = 0.0;  // relative funding rate sampled at entry (SP3)
+        let mut total_funding: f64 = 0.0;  // accumulated funding cash flow (SP3)
         let mut entry_time:  u64 = 0;
         let mut pos_size:    f32 = 0.0;
         // Rolling volatility (EMA of |per-tick return| in bps). In adaptive mode the
@@ -1673,7 +1734,10 @@ pub(crate) unsafe fn trading_strategy(
                     while p_head != p_tail {
                         if tick_now_ns >= pend_due[p_head & PMASK] {
                             let fslot = pend_slot[p_head & PMASK];
-                            (*order_book.trade_log.entries.get())[fslot].fill_price = price;
+                            // One-sided buys cross the spread to the ask (SP2); falls
+                            // back to mid when this tick carries no quote (non-v4 feed).
+                            (*order_book.trade_log.entries.get())[fslot].fill_price =
+                                crate::model::taker_fill(price, tick_ptr.bid, tick_ptr.ask, true, order_book.trade_cfg.slippage_bps);
                             order_book.filled.fetch_add(1, Ordering::Relaxed);
                             p_head += 1;
                         } else {
@@ -1897,7 +1961,9 @@ pub(crate) unsafe fn trading_strategy(
                         }
                         let warmed = current_seq > WARMUP_PACKETS;
                         let halted = order_book.halt.load(Ordering::Relaxed);
-                        let decision = model.on_traded_tick(price, tick_ptr.volume, tick_now_ns, warmed, halted);
+                        let decision = model.on_traded_tick(price, tick_ptr.bid, tick_ptr.ask, tick_ptr.mark_price, tick_ptr.funding_rate, tick_ptr.volume, tick_now_ns, warmed, halted);
+                        // Keep the OrderBook funding accumulator in sync (SP3 reporting).
+                        order_book.funding_quote_bits.store(model.total_funding_quote.to_bits(), Ordering::Relaxed);
 
                         // Expose the signal: latest value, downsampled series, vol.
                         order_book.latest_signal_bits.store(model.latest_signal_bps().to_bits(), Ordering::Relaxed);
@@ -1979,10 +2045,15 @@ pub(crate) unsafe fn trading_strategy(
                                     let depth_mult = ((depth_frac * 10_000.0) / entry_bps.max(VOL_FLOOR))
                                                      .clamp(1.0, tcfg.max_size_mult) as f64;
                                     let risk     = (tcfg.risk_frac as f64 * depth_mult).min(1.0);
-                                    entry_margin = equity * risk;
-                                    let notional = entry_margin * tcfg.leverage as f64;
-                                    pos_size     = (notional / price as f64) as f32;  // units
-                                    entry_price  = price;
+                                    // SP5 sizing: vol-target / exposure-cap when set, else conviction sizing.
+                                    let (notional, margin) = crate::model::sized_notional(equity, risk,
+                                        tcfg.leverage as f64, tcfg.vol_target_bps, sl_bps as f64, tcfg.max_exposure_mult);
+                                    entry_margin = margin;
+                                    // Cross the spread on entry: long buys the ask, short sells the bid.
+                                    entry_price  = crate::model::taker_fill(price, tick_ptr.bid, tick_ptr.ask, dir == 1, tcfg.slippage_bps);
+                                    entry_mid    = price;
+                                    entry_funding = if tcfg.funding_bps_per_hr != 0.0 { tcfg.funding_bps_per_hr / 10_000.0 } else { tick_ptr.funding_rate };
+                                    pos_size     = (notional / entry_price as f64) as f32;  // units
                                     entry_time   = tick_now_ns;
                                     pos_side     = dir;
                                     order_book.net_position.fetch_add(dir, Ordering::Relaxed);
@@ -1993,13 +2064,24 @@ pub(crate) unsafe fn trading_strategy(
                                 let move_bps = (price - entry_price) / entry_price
                                     * 10_000.0 * pos_side as f32;
                                 let opp        = if pos_side == 1 { short_sig } else { long_sig };
-                                let liquidated = move_bps <= -liq_bps;
+                                // Perp liquidation is on the MARK price (SP3); fall back to mid if absent.
+                                let mark_move  = if tick_ptr.mark_price > 0.0 { (tick_ptr.mark_price - entry_price) / entry_price * 10_000.0 * pos_side as f32 } else { move_bps };
+                                let liquidated = mark_move <= -liq_bps;
                                 if move_bps >= tp_bps || move_bps <= -sl_bps || opp || liquidated {
-                                    let gross_bps  = move_bps as f64;
+                                    // Cross the spread on exit: long sells the bid, short buys the ask.
+                                    // move_bps (mid-marked) drove the triggers; realized gross is fill-to-fill.
+                                    let exit_fill  = crate::model::taker_fill(price, tick_ptr.bid, tick_ptr.ask, pos_side == -1, tcfg.slippage_bps);
+                                    let gross_bps  = ((exit_fill - entry_price) / entry_price * 10_000.0 * pos_side as f32) as f64;
+                                    // Spread+slippage cost = mid-to-mid ideal move − realized fill-to-fill gross.
+                                    let spread_cost = (((price - entry_mid) / entry_mid * 10_000.0 * pos_side as f32) as f64 - gross_bps) as f32;
                                     let notional   = entry_margin * tcfg.leverage as f64;
                                     let fees_quote = notional * (2.0 * tcfg.fee_bps as f64 / 10_000.0);
+                                    // Funding accrued over the hold (SP3): positive rate → a long pays.
+                                    let funding_q  = crate::model::funding_flow(notional, entry_funding, tick_now_ns.saturating_sub(entry_time), pos_side);
+                                    total_funding += funding_q;
+                                    order_book.funding_quote_bits.store(total_funding.to_bits(), Ordering::Relaxed);
                                     // Isolated margin: a loss can't exceed the posted margin.
-                                    let raw_pnl    = notional * (gross_bps / 10_000.0) - fees_quote;
+                                    let raw_pnl    = notional * (gross_bps / 10_000.0) - fees_quote + funding_q;
                                     let pnl_quote  = raw_pnl.max(-entry_margin);
                                     let was_liq    = liquidated || raw_pnl <= -entry_margin;
 
@@ -2015,13 +2097,13 @@ pub(crate) unsafe fn trading_strategy(
                                     let rt = &mut (*order_book.round_trips.entries.get())[slot];
                                     rt.entry_time_ns = entry_time;
                                     rt.exit_time_ns  = tick_now_ns;
-                                    rt.hold_ns       = tick_now_ns.saturating_sub(entry_time);
+                                    rt.spread_cost_bps = spread_cost;
                                     rt.side          = pos_side;
                                     rt.entry_price   = entry_price;
-                                    rt.exit_price    = price;
+                                    rt.exit_price    = exit_fill;
                                     rt.size          = pos_size;
                                     rt.gross_bps     = gross_bps as f32;
-                                    rt.net_bps       = (gross_bps - 2.0 * tcfg.fee_bps as f64) as f32;
+                                    rt.net_bps       = (gross_bps - 2.0 * tcfg.fee_bps as f64 + funding_q / notional * 10_000.0) as f32;
                                     rt.pnl_quote     = pnl_quote as f32;
                                     rt.fees_quote    = fees_quote as f32;
                                     rt.flags         = if was_liq { 1.0 } else { 0.0 };
@@ -2069,5 +2151,43 @@ pub(crate) unsafe fn trading_strategy(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A RoundTrip with the fields the scorecard reads; others defaulted.
+    fn rt(side: i64, net_bps: f32, pnl: f32, size: f32, entry_price: f32, entry_t: u64, exit_t: u64) -> models::RoundTrip {
+        models::RoundTrip {
+            entry_time_ns: entry_t, exit_time_ns: exit_t, spread_cost_bps: 0.0,
+            side, entry_price, exit_price: entry_price, size,
+            gross_bps: net_bps, net_bps, pnl_quote: pnl, fees_quote: 0.0, flags: 0.0,
+        }
+    }
+
+    #[test]
+    fn scorecard_risk_metrics() {
+        // capital 100. equity path: 100 → 110 (peak) → 90 (DD) → 95 (still DD).
+        let rts = [
+            rt( 1,  10.0,  10.0, 1.0, 100.0,  50, 100),  // long  win
+            rt(-1, -20.0, -20.0, 1.0, 100.0, 150, 200),  // short loss
+            rt( 1,   5.0,   5.0, 1.0, 100.0, 350, 400),  // long  win
+        ];
+        let s = scorecard(&rts, 100.0).unwrap();
+        // Sortino: mean = -5/3; downside_dev = sqrt((0+400+0)/3) = 11.547 → -0.1443.
+        assert!((s.sortino - (-0.1443)).abs() < 0.01, "sortino={}", s.sortino);
+        // Calmar: return -5%, maxDD 20/110 = 18.18% → -0.275.
+        assert!((s.calmar - (-0.275)).abs() < 0.02, "calmar={}", s.calmar);
+        // Turnover: (100+100+100)/100 = 3.0.
+        assert!((s.turnover - 3.0).abs() < 1e-6, "turnover={}", s.turnover);
+        // Time-in-DD: underwater from exit2→exit3 (200..400) of total exit1→exit3 (100..400) = 200/300.
+        assert!((s.time_in_dd_pct - 66.67).abs() < 0.5, "time_in_dd={}", s.time_in_dd_pct);
+        // Per side: longs 2 (net (10+5)/2=7.5, 100% win); shorts 1 (net -20, 0% win).
+        assert!((s.long_net_bps  - 7.5).abs()   < 1e-6, "long_net={}", s.long_net_bps);
+        assert!((s.long_win_rate - 100.0).abs() < 1e-6, "long_wr={}", s.long_win_rate);
+        assert!((s.short_net_bps - (-20.0)).abs() < 1e-6, "short_net={}", s.short_net_bps);
+        assert!((s.short_win_rate - 0.0).abs()  < 1e-6, "short_wr={}", s.short_win_rate);
     }
 }

@@ -308,7 +308,10 @@ fn parse_futures_ticker(msg: &str) -> Option<(f32, f32, f32, f32, u64)> {
         return None;
     }
     let mark = json_num(msg, "markPrice").map(|v| v as f32).unwrap_or((bid + ask) / 2.0);
-    let funding = json_num(msg, "funding_rate").map(|v| v as f32).unwrap_or(0.0);
+    // The *relative* funding rate (per-hour fraction of spot) is the directly-usable
+    // one for accrual; the absolute `funding_rate` is USD/contract/hr (needs contract
+    // size). Omitted when zero → 0.0. Positive → longs pay shorts.
+    let funding = json_num(msg, "relative_funding_rate").map(|v| v as f32).unwrap_or(0.0);
     let origin_ns = json_num(msg, "time").map(|ms| (ms as u64).wrapping_mul(1_000_000)).unwrap_or(0);
     Some((bid, ask, mark, funding, origin_ns))
 }
@@ -330,10 +333,10 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Perform the WebSocket opening handshake. Returns any bytes already read past
 /// the response headers (the start of the frame stream).
-fn ws_handshake(stream: &mut TcpStream, host: &str) -> io::Result<Vec<u8>> {
+fn ws_handshake(stream: &mut TcpStream, host: &str, path: &str) -> io::Result<Vec<u8>> {
     let key = base64_encode(&random_bytes(16));
     let req = format!(
-        "GET / HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nOrigin: https://{host}\r\n\r\n"
     );
     stream.write_all(req.as_bytes())?;
@@ -624,7 +627,7 @@ fn run_live(
     println!("[kraken-feed] connecting to {endpoint} (stunnel → {KRAKEN_HOST}:443)");
     let mut stream = TcpStream::connect(endpoint)?;
     stream.set_nodelay(true).ok();
-    let mut acc = ws_handshake(&mut stream, KRAKEN_HOST)?;
+    let mut acc = ws_handshake(&mut stream, KRAKEN_HOST, "/")?;
     println!("[kraken-feed] websocket connected; subscribing to {pair} (0) + {ref_pair} (1) trades");
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
 
@@ -707,7 +710,7 @@ fn run_futures(
     println!("[kraken-feed] connecting to {endpoint} (stunnel → {KRAKEN_FUTURES_HOST}:443)");
     let mut stream = TcpStream::connect(endpoint)?;
     stream.set_nodelay(true).ok();
-    let mut acc = ws_handshake(&mut stream, KRAKEN_FUTURES_HOST)?;
+    let mut acc = ws_handshake(&mut stream, KRAKEN_FUTURES_HOST, "/ws/v1")?;
     println!("[kraken-feed] websocket connected; subscribing to futures ticker {product}");
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
 
@@ -738,8 +741,8 @@ fn run_futures(
                     let msg = String::from_utf8_lossy(&payload);
                     if let Some((bid, ask, mark, funding, origin_ns)) = parse_futures_ticker(&msg) {
                         if first {
-                            println!("[kraken-feed] first ticker: mid {:.1}  spread {:.3} bps  funding {:.6}%",
-                                     mid(bid, ask), spread_bps(bid, ask), funding * 100.0);
+                            println!("[kraken-feed] first ticker: mid {:.1}  spread {:.3} bps  funding {:.8} /hr (relative)",
+                                     mid(bid, ask), spread_bps(bid, ask), funding);
                             first = false;
                         }
                         let pkt = build_packet_v4(
@@ -914,7 +917,7 @@ mod tests {
         assert!((trades[0].1 + 0.15850568).abs() < 1e-6);   // sell → negative signed volume
         assert_eq!(trades[0].2, 1_534_614_057_321_597_000);
         assert!((trades[1].0 - 5541.3).abs() < 0.01);
-        assert!((trades[1].1 - 0.10000000).abs() < 1e-6);   // buy → positive
+        assert!((trades[1].1 - 0.1).abs() < 1e-6);   // buy → positive
     }
 
     #[test]
@@ -962,12 +965,12 @@ mod tests {
 
     #[test]
     fn parse_futures_ticker_message() {
-        let msg = r#"{"feed":"ticker","product_id":"PF_XBTUSD","bid":60234.0,"ask":60235.5,"markPrice":60234.8,"last":60234.5,"funding_rate":1.2e-7,"time":1718040000000}"#;
+        let msg = r#"{"feed":"ticker","product_id":"PF_XBTUSD","bid":60234.0,"ask":60235.5,"markPrice":60234.8,"last":60234.5,"funding_rate":1.2e-7,"relative_funding_rate":3.5e-6,"time":1718040000000}"#;
         let t = parse_futures_ticker(msg).expect("a ticker");
         assert!((t.0 - 60234.0).abs() < 0.01);   // bid
         assert!((t.1 - 60235.5).abs() < 0.01);   // ask
         assert!((t.2 - 60234.8).abs() < 0.01);   // mark
-        assert!((t.3 - 1.2e-7).abs() < 1e-12);   // funding
+        assert!((t.3 - 3.5e-6).abs() < 1e-10);   // relative_funding_rate (not the absolute one)
         assert_eq!(t.4, 1_718_040_000_000_000_000); // time ms → ns
     }
 

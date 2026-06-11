@@ -72,6 +72,54 @@ pub(crate) enum Decision {
     Exit(RoundTrip),
 }
 
+/// Taker fill price: a buy crosses up to the **ask**, a sell crosses down to the
+/// **bid**, plus `slippage_bps` of extra adverse slippage (book-walking / impact).
+/// Falls back to `mid` when there is no usable quote (bid/ask are 0 or degenerate,
+/// e.g. the spot trade feed or legacy v1–v3 packets), so non-v4 feeds keep filling
+/// at the observed price — SP2 spread cost applies only where a real spread exists.
+pub(crate) fn taker_fill(mid: f32, bid: f32, ask: f32, is_buy: bool, slippage_bps: f32) -> f32 {
+    let have_quote = bid > 0.0 && ask >= bid;
+    let base = if is_buy {
+        if have_quote { ask } else { mid }
+    } else if have_quote { bid } else { mid };
+    let slip = slippage_bps / 10_000.0;
+    if is_buy { base * (1.0 + slip) } else { base * (1.0 - slip) }
+}
+
+/// Funding cash flow accrued over a hold, in quote currency (added to P&L).
+/// `rel_rate` is the per-hour **relative** funding rate (fraction of notional per
+/// hour, as Kraken reports for linear perps). Positive rate → a long PAYS (negative
+/// flow), a short RECEIVES. Continuous accrual: flow = −side · notional · rel_rate ·
+/// (hold_ns / 1 hour). Returns 0 when the rate or hold is zero (non-futures feeds).
+pub(crate) fn funding_flow(notional: f64, rel_rate: f32, hold_ns: u64, side: i64) -> f64 {
+    let hours = hold_ns as f64 / 3_600_000_000_000.0;   // ns → hours
+    -(side as f64) * notional * rel_rate as f64 * hours
+}
+
+/// Position sizing (SP5). Returns `(notional, margin)` where `margin = notional /
+/// leverage`. Default (`vol_target_bps == 0`) is the existing conviction sizing:
+/// `notional = equity · risk · leverage`. When `vol_target_bps > 0`, size so that a
+/// stop-loss of `sl_bps` risks ≈`vol_target_bps` of equity: `notional = equity ·
+/// vol_target_bps / sl_bps` (leverage-independent — leverage only sets the margin).
+/// Either way, cap notional at `max_exposure_mult · equity` (0 = uncapped).
+pub(crate) fn sized_notional(
+    equity: f64, risk: f64, leverage: f64, vol_target_bps: f32, sl_bps: f64, max_exposure_mult: f32,
+) -> (f64, f64) {
+    let mut notional = if vol_target_bps > 0.0 && sl_bps > 0.0 {
+        equity * (vol_target_bps as f64 / sl_bps)
+    } else {
+        equity * risk * leverage
+    };
+    // Hard margin-capacity bound: you can't post more margin than equity, so
+    // notional ≤ equity · leverage. (Conviction sizing already satisfies this;
+    // vol-target can blow past it on a tight stop.)
+    notional = notional.min(equity * leverage.max(1.0));
+    if max_exposure_mult > 0.0 {
+        notional = notional.min(max_exposure_mult as f64 * equity);
+    }
+    (notional, notional / leverage.max(1.0))
+}
+
 pub(crate) struct AlphaModel {
     cfg: TradeCfg,
     // Signal EMAs: index 0 = traded instrument, 1 = reference.
@@ -95,7 +143,9 @@ pub(crate) struct AlphaModel {
     feat_scale: [f32; N_FEATURES],
     // Position / capital.
     pub(crate) pos_side: i64, // 0 flat, +1 long, -1 short
-    entry_price: f32,
+    entry_price: f32,         // adverse entry fill (ask for long, bid for short)
+    entry_mid: f32,           // mid at entry, for the spread-cost accounting
+    entry_funding: f32,       // relative funding rate (per hr) sampled at entry (SP3)
     entry_time: u64,
     pos_size: f32,
     entry_margin: f64,
@@ -103,6 +153,7 @@ pub(crate) struct AlphaModel {
     pub(crate) equity: f64,
     pub(crate) ruined: bool,
     latest_signal: f32,
+    pub(crate) total_funding_quote: f64,  // accumulated funding cash flow (SP3, quote)
 }
 
 impl AlphaModel {
@@ -115,9 +166,10 @@ impl AlphaModel {
             vol_ema: 0.0, vol_prev: 0.0, vol_init: false,
             scale_trend: 1.0, scale_basket: 1.0, scale_leadlag: 1.0,
             policy, feat_scale: [1.0; N_FEATURES],
-            pos_side: 0, entry_price: 0.0, entry_time: 0, pos_size: 0.0,
+            pos_side: 0, entry_price: 0.0, entry_mid: 0.0, entry_funding: 0.0, entry_time: 0, pos_size: 0.0,
             entry_margin: 0.0, best_price: 0.0,
             equity: cfg.capital as f64, ruined: false, latest_signal: 0.0,
+            total_funding_quote: 0.0,
         }
     }
 
@@ -146,8 +198,10 @@ impl AlphaModel {
 
     /// Process a traded-instrument tick. `warmed` gates trading until past warmup;
     /// `halted` blocks new entries (exits still proceed).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_traded_tick(
-        &mut self, price: f32, signed_vol: f32, now_ns: u64, warmed: bool, halted: bool,
+        &mut self, price: f32, bid: f32, ask: f32, mark: f32, funding: f32,
+        signed_vol: f32, now_ns: u64, warmed: bool, halted: bool,
     ) -> Decision {
         // Own EMAs, order flow, volatility.
         if self.ema_init[0] {
@@ -222,13 +276,19 @@ impl AlphaModel {
             let conv = ((s.abs() - self.cfg.signal_thr_bps).max(0.0)
                         / self.cfg.signal_thr_bps.max(0.1) + 1.0).min(self.cfg.max_size_mult) as f64;
             let risk = (self.cfg.risk_frac as f64 * conv).min(1.0);
-            self.entry_margin = self.equity * risk;
-            let notional = self.entry_margin * self.cfg.leverage as f64;
-            self.pos_size   = (notional / price as f64) as f32;
-            self.entry_price = price;
+            // SP5 sizing: vol-target / exposure-cap when set, else conviction sizing.
+            let (notional, margin) = sized_notional(self.equity, risk, self.cfg.leverage as f64,
+                self.cfg.vol_target_bps, self.cfg.sl_bps as f64, self.cfg.max_exposure_mult);
+            self.entry_margin = margin;
+            // Cross the spread on entry: a long buys the ask, a short sells the bid.
+            self.entry_price = taker_fill(price, bid, ask, dir == 1, self.cfg.slippage_bps);
+            self.entry_mid  = price;
+            // Sample the funding rate at entry (manual override or feed); held constant over the hold.
+            self.entry_funding = if self.cfg.funding_bps_per_hr != 0.0 { self.cfg.funding_bps_per_hr / 10_000.0 } else { funding };
+            self.pos_size   = (notional / self.entry_price as f64) as f32;
             self.entry_time = now_ns;
             self.pos_side = dir;
-            self.best_price = price;
+            self.best_price = price;   // mark at mid for the trailing stop
             Decision::Enter { side: dir, signal_bps: s }
         } else {
             if self.pos_side == 1 { if price > self.best_price { self.best_price = price; } }
@@ -242,36 +302,102 @@ impl AlphaModel {
             let flip = if self.pos_side == 1 { s < -self.cfg.signal_exit_bps }
                        else { s > self.cfg.signal_exit_bps };
             let liq_bps    = 10_000.0 / self.cfg.leverage.max(1.0);
-            let liquidated = move_bps <= -liq_bps;
+            // Perp liquidation is on the MARK price (SP3); fall back to mid if absent.
+            let mark_move  = if mark > 0.0 { (mark - self.entry_price) / self.entry_price * 10_000.0 * self.pos_side as f32 } else { move_bps };
+            let liquidated = mark_move <= -liq_bps;
             let tp_hit = self.cfg.tp_bps > 0.0 && move_bps >=  self.cfg.tp_bps;
             let sl_hit = self.cfg.sl_bps > 0.0 && move_bps <= -self.cfg.sl_bps;
             if !(trail_hit || flip || tp_hit || sl_hit || liquidated) { return Decision::None; }
 
-            let gross_bps  = move_bps as f64;
+            // Cross the spread on exit: a long sells the bid, a short buys the ask.
+            // move_bps (mid-marked) drove the triggers above; the realized gross is
+            // measured fill-to-fill, so both half-spreads land in the P&L.
+            let exit_fill  = taker_fill(price, bid, ask, self.pos_side == -1, self.cfg.slippage_bps);
+            let gross_bps  = ((exit_fill - self.entry_price) / self.entry_price * 10_000.0 * self.pos_side as f32) as f64;
             let notional   = self.entry_margin * self.cfg.leverage as f64;
             let rt_fee     = self.round_trip_fee_bps() as f64;
             let fees_quote = notional * (rt_fee / 10_000.0);
-            let raw_pnl    = notional * (gross_bps / 10_000.0) - fees_quote;
+            // Funding accrued over the hold (SP3): positive rate → a long pays.
+            let funding_q  = funding_flow(notional, self.entry_funding, now_ns.saturating_sub(self.entry_time), self.pos_side);
+            self.total_funding_quote += funding_q;
+            let raw_pnl    = notional * (gross_bps / 10_000.0) - fees_quote + funding_q;
             let pnl_quote  = raw_pnl.max(-self.entry_margin);
             let was_liq    = liquidated || raw_pnl <= -self.entry_margin;
             self.equity += pnl_quote;
             if self.equity <= 0.0 { self.equity = 0.0; self.ruined = true; }
             let side = self.pos_side;
             self.pos_side = 0;
+            // Spread+slippage cost = the mid-to-mid "ideal" move minus the realized
+            // fill-to-fill gross. Positive = the spread/slippage ate this many bps.
+            let ideal_gross = ((price - self.entry_mid) / self.entry_mid * 10_000.0 * side as f32) as f64;
             Decision::Exit(RoundTrip {
                 entry_time_ns: self.entry_time,
                 exit_time_ns: now_ns,
-                hold_ns: now_ns.saturating_sub(self.entry_time),
+                spread_cost_bps: (ideal_gross - gross_bps) as f32,
                 side,
                 entry_price: self.entry_price,
-                exit_price: price,
+                exit_price: exit_fill,
                 size: self.pos_size,
                 gross_bps: gross_bps as f32,
-                net_bps: (gross_bps - rt_fee) as f32,
+                net_bps: (gross_bps - rt_fee + funding_q / notional * 10_000.0) as f32,
                 pnl_quote: pnl_quote as f32,
                 fees_quote: fees_quote as f32,
                 flags: if was_liq { 1.0 } else { 0.0 },
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn taker_fill_crosses_spread() {
+        // Buy crosses to the ask; sell crosses to the bid.
+        assert_eq!(taker_fill(100.0, 99.95, 100.05, true, 0.0), 100.05);
+        assert_eq!(taker_fill(100.0, 99.95, 100.05, false, 0.0), 99.95);
+        // No usable quote (bid/ask 0, or ask<bid) → fall back to mid.
+        assert_eq!(taker_fill(100.0, 0.0, 0.0, true, 0.0), 100.0);
+        assert_eq!(taker_fill(100.0, 0.0, 0.0, false, 0.0), 100.0);
+        assert_eq!(taker_fill(100.0, 101.0, 99.0, true, 0.0), 100.0); // crossed quote → mid
+        // Slippage is adverse: buys fill higher, sells lower (10 bps).
+        assert!((taker_fill(100.0, 0.0, 0.0, true,  10.0) - 100.1).abs() < 1e-3);
+        assert!((taker_fill(100.0, 0.0, 0.0, false, 10.0) -  99.9).abs() < 1e-3);
+        // Spread + slippage stack on entry: ask 100.05, +10bps → ~100.150.
+        assert!((taker_fill(100.0, 99.95, 100.05, true, 10.0) - 100.15005).abs() < 1e-2);
+    }
+
+    #[test]
+    fn funding_flow_sign_and_scale() {
+        let h = 3_600_000_000_000u64;                 // 1 hour in ns
+        // $100k notional, 0.0001/hr (1 bp/hr), 1h: long PAYS $10, short RECEIVES $10.
+        assert!((funding_flow(100_000.0, 0.0001, h, 1)  - (-10.0)).abs() < 1e-6);
+        assert!((funding_flow(100_000.0, 0.0001, h, -1) -  (10.0)).abs() < 1e-6);
+        // Negative rate flips: long receives.
+        assert!((funding_flow(100_000.0, -0.0001, h, 1) -  (10.0)).abs() < 1e-6);
+        // Half the hold → half the flow.
+        assert!((funding_flow(100_000.0, 0.0001, h / 2, 1) - (-5.0)).abs() < 1e-6);
+        // Zero rate or zero hold → zero.
+        assert_eq!(funding_flow(100_000.0, 0.0, h, 1), 0.0);
+        assert_eq!(funding_flow(100_000.0, 0.0001, 0, 1), 0.0);
+    }
+
+    #[test]
+    fn sized_notional_modes() {
+        // Default (vol_target 0): conviction sizing = equity · risk · leverage.
+        let (n, m) = sized_notional(10_000.0, 0.1, 2.0, 0.0, 100.0, 0.0);
+        assert!((n - 2_000.0).abs() < 1e-6, "n={n}");   // 10000·0.1·2
+        assert!((m - 1_000.0).abs() < 1e-6, "m={m}");   // notional / leverage
+        // Vol-target: notional = equity · target/sl (leverage-independent). 50bps / 100bps → 0.5·equity.
+        let (n, _) = sized_notional(10_000.0, 0.1, 2.0, 50.0, 100.0, 0.0);
+        assert!((n - 5_000.0).abs() < 1e-6, "n={n}");
+        // Exposure cap clamps notional at mult·equity (would be 50k, capped at 2·10k).
+        let (n, _) = sized_notional(10_000.0, 1.0, 5.0, 0.0, 100.0, 2.0);
+        assert!((n - 20_000.0).abs() < 1e-6, "n={n}");
+        // Vol-target bounded by margin capacity: 50bps/5bps wants 10·equity, but at
+        // 2× leverage the hard cap is equity·leverage = 2·equity.
+        let (n, _) = sized_notional(10_000.0, 0.1, 2.0, 50.0, 5.0, 0.0);
+        assert!((n - 20_000.0).abs() < 1e-6, "n={n}");
     }
 }

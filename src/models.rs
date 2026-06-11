@@ -191,6 +191,15 @@ pub(crate) struct TradeCfg {
     pub fee_gate:        bool, // require expected move ≥ round-trip cost + min_edge
     pub min_edge_bps:    f32,  // edge buffer over cost for the fee gate
     pub normalize:       bool, // z-score the composite-signal terms
+    // Realistic fills (SP2): entries/exits cross the real bid/ask spread; this adds
+    // extra adverse slippage in bps on top of the spread (0 = spread only).
+    pub slippage_bps:    f32,
+    // Funding (SP3): manual relative funding-rate override in bps/hr for offline
+    // testing; 0 = use the feed's per-tick relative_funding_rate.
+    pub funding_bps_per_hr: f32,
+    // Smarter sizing (SP5, both opt-in / default 0 = current conviction sizing):
+    pub vol_target_bps:   f32,  // size so the stop-loss risks ~this many bps of equity
+    pub max_exposure_mult: f32, // hard cap on notional as a multiple of equity
 }
 
 /// One completed round-trip (entry → exit), the unit of the P&L scorecard.
@@ -199,7 +208,8 @@ pub(crate) struct TradeCfg {
 pub(crate) struct RoundTrip {
     pub entry_time_ns: u64,
     pub exit_time_ns:  u64,
-    pub hold_ns:       u64,
+    pub spread_cost_bps: f32, // SP2: spread+slippage cost vs mid-to-mid (bps). Hold
+                              // time is derived as exit_time_ns - entry_time_ns.
     pub side:          i64,   // +1 long, -1 short
     pub entry_price:   f32,
     pub exit_price:    f32,
@@ -257,6 +267,7 @@ pub(crate) struct OrderBook {
     pub(crate) spread_lo_bits: AtomicU32,       // min observed spread (f32 bps bits); sole writer: ingestor
     pub(crate) spread_hi_bits: AtomicU32,       // max observed spread (f32 bps bits); sole writer: ingestor
     pub(crate) funding_bits:   AtomicU32,       // latest funding rate (f32 bits); sole writer: ingestor
+    pub(crate) funding_quote_bits: AtomicU64,   // SP3: accumulated funding cash flow (f64 bits); sole writer: strategy
     // Target-price buy level, set once by main from HFT_TARGET_PRICE. 0.0 = breakout mode.
     pub(crate) target_price:  f32,
     // Relative-dip threshold in bps (HFT_TARGET_DIP_BPS). >0 = buy on a dip of this
