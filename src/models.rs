@@ -194,6 +194,9 @@ pub(crate) struct TradeCfg {
     // Realistic fills (SP2): entries/exits cross the real bid/ask spread; this adds
     // extra adverse slippage in bps on top of the spread (0 = spread only).
     pub slippage_bps:    f32,
+    // Funding (SP3): manual relative funding-rate override in bps/hr for offline
+    // testing; 0 = use the feed's per-tick relative_funding_rate.
+    pub funding_bps_per_hr: f32,
 }
 
 /// One completed round-trip (entry → exit), the unit of the P&L scorecard.

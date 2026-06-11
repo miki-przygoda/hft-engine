@@ -127,6 +127,9 @@ pub mod config {
     // Realistic fills (SP2): extra adverse slippage in bps on top of the crossed
     // bid/ask spread (HFT_SLIPPAGE_BPS). 0 = spread only.
     pub const SLIPPAGE_BPS_DEFAULT: f32 = 0.0;
+    // Funding (SP3): manual relative funding-rate override (bps/hr) for offline
+    // testing; 0 = use the feed's per-tick relative_funding_rate.
+    pub const FUNDING_BPS_PER_HR_DEFAULT: f32 = 0.0;
 
     // ── Learned policy (HFT_MODEL / --train) ─────────────────────────────────
     // A tiny MLP (6→8→1, 65 f32 weights — see model::Policy) supplies the signal

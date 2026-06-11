@@ -121,6 +121,7 @@ pub(crate) struct AlphaModel {
     pub(crate) pos_side: i64, // 0 flat, +1 long, -1 short
     entry_price: f32,         // adverse entry fill (ask for long, bid for short)
     entry_mid: f32,           // mid at entry, for the spread-cost accounting
+    entry_funding: f32,       // relative funding rate (per hr) sampled at entry (SP3)
     entry_time: u64,
     pos_size: f32,
     entry_margin: f64,
@@ -128,6 +129,7 @@ pub(crate) struct AlphaModel {
     pub(crate) equity: f64,
     pub(crate) ruined: bool,
     latest_signal: f32,
+    pub(crate) total_funding_quote: f64,  // accumulated funding cash flow (SP3, quote)
 }
 
 impl AlphaModel {
@@ -140,9 +142,10 @@ impl AlphaModel {
             vol_ema: 0.0, vol_prev: 0.0, vol_init: false,
             scale_trend: 1.0, scale_basket: 1.0, scale_leadlag: 1.0,
             policy, feat_scale: [1.0; N_FEATURES],
-            pos_side: 0, entry_price: 0.0, entry_mid: 0.0, entry_time: 0, pos_size: 0.0,
+            pos_side: 0, entry_price: 0.0, entry_mid: 0.0, entry_funding: 0.0, entry_time: 0, pos_size: 0.0,
             entry_margin: 0.0, best_price: 0.0,
             equity: cfg.capital as f64, ruined: false, latest_signal: 0.0,
+            total_funding_quote: 0.0,
         }
     }
 
@@ -173,7 +176,8 @@ impl AlphaModel {
     /// `halted` blocks new entries (exits still proceed).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_traded_tick(
-        &mut self, price: f32, bid: f32, ask: f32, signed_vol: f32, now_ns: u64, warmed: bool, halted: bool,
+        &mut self, price: f32, bid: f32, ask: f32, mark: f32, funding: f32,
+        signed_vol: f32, now_ns: u64, warmed: bool, halted: bool,
     ) -> Decision {
         // Own EMAs, order flow, volatility.
         if self.ema_init[0] {
@@ -253,6 +257,8 @@ impl AlphaModel {
             // Cross the spread on entry: a long buys the ask, a short sells the bid.
             self.entry_price = taker_fill(price, bid, ask, dir == 1, self.cfg.slippage_bps);
             self.entry_mid  = price;
+            // Sample the funding rate at entry (manual override or feed); held constant over the hold.
+            self.entry_funding = if self.cfg.funding_bps_per_hr != 0.0 { self.cfg.funding_bps_per_hr / 10_000.0 } else { funding };
             self.pos_size   = (notional / self.entry_price as f64) as f32;
             self.entry_time = now_ns;
             self.pos_side = dir;
@@ -270,7 +276,9 @@ impl AlphaModel {
             let flip = if self.pos_side == 1 { s < -self.cfg.signal_exit_bps }
                        else { s > self.cfg.signal_exit_bps };
             let liq_bps    = 10_000.0 / self.cfg.leverage.max(1.0);
-            let liquidated = move_bps <= -liq_bps;
+            // Perp liquidation is on the MARK price (SP3); fall back to mid if absent.
+            let mark_move  = if mark > 0.0 { (mark - self.entry_price) / self.entry_price * 10_000.0 * self.pos_side as f32 } else { move_bps };
+            let liquidated = mark_move <= -liq_bps;
             let tp_hit = self.cfg.tp_bps > 0.0 && move_bps >=  self.cfg.tp_bps;
             let sl_hit = self.cfg.sl_bps > 0.0 && move_bps <= -self.cfg.sl_bps;
             if !(trail_hit || flip || tp_hit || sl_hit || liquidated) { return Decision::None; }
@@ -283,7 +291,10 @@ impl AlphaModel {
             let notional   = self.entry_margin * self.cfg.leverage as f64;
             let rt_fee     = self.round_trip_fee_bps() as f64;
             let fees_quote = notional * (rt_fee / 10_000.0);
-            let raw_pnl    = notional * (gross_bps / 10_000.0) - fees_quote;
+            // Funding accrued over the hold (SP3): positive rate → a long pays.
+            let funding_q  = funding_flow(notional, self.entry_funding, now_ns.saturating_sub(self.entry_time), self.pos_side);
+            self.total_funding_quote += funding_q;
+            let raw_pnl    = notional * (gross_bps / 10_000.0) - fees_quote + funding_q;
             let pnl_quote  = raw_pnl.max(-self.entry_margin);
             let was_liq    = liquidated || raw_pnl <= -self.entry_margin;
             self.equity += pnl_quote;
@@ -302,7 +313,7 @@ impl AlphaModel {
                 exit_price: exit_fill,
                 size: self.pos_size,
                 gross_bps: gross_bps as f32,
-                net_bps: (gross_bps - rt_fee) as f32,
+                net_bps: (gross_bps - rt_fee + funding_q / notional * 10_000.0) as f32,
                 pnl_quote: pnl_quote as f32,
                 fees_quote: fees_quote as f32,
                 flags: if was_liq { 1.0 } else { 0.0 },

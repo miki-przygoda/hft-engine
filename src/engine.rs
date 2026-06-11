@@ -643,7 +643,7 @@ fn scorecard(rts: &[models::RoundTrip], capital: f64) -> Option<Scorecard> {
 // in-sample/out-of-sample split and a small parameter grid, ranked by OOS return.
 
 #[derive(Copy, Clone)]
-struct BtTick { id: u8, price: f32, vol: f32, t_ns: u64, bid: f32, ask: f32 }
+struct BtTick { id: u8, price: f32, vol: f32, t_ns: u64, bid: f32, ask: f32, mark: f32, funding: f32 }
 
 fn load_capture(path: &str) -> std::io::Result<Vec<BtTick>> {
     let data = std::fs::read(path)?;
@@ -668,6 +668,8 @@ fn load_capture(path: &str) -> std::io::Result<Vec<BtTick>> {
             // v4 packets (>= 49 bytes) carry bid/ask at [33..41]; older packets 0.
             bid:   if len >= 49 { f32::from_le_bytes(pkt[33..37].try_into().unwrap()) } else { 0.0 },
             ask:   if len >= 49 { f32::from_le_bytes(pkt[37..41].try_into().unwrap()) } else { 0.0 },
+            mark:  if len >= 49 { f32::from_le_bytes(pkt[41..45].try_into().unwrap()) } else { 0.0 },
+            funding: if len >= 49 { f32::from_le_bytes(pkt[45..49].try_into().unwrap()) } else { 0.0 },
         });
     }
     Ok(out)
@@ -687,7 +689,7 @@ fn run_model(
         seq += 1;
         let warmed = seq > WARMUP_PACKETS;
         if let crate::model::Decision::Exit(rt) =
-            model.on_traded_tick(tk.price, tk.bid, tk.ask, tk.vol, tk.t_ns, warmed, false)
+            model.on_traded_tick(tk.price, tk.bid, tk.ask, tk.mark, tk.funding, tk.vol, tk.t_ns, warmed, false)
         {
             rts.push(rt);
         }
@@ -1906,7 +1908,7 @@ pub(crate) unsafe fn trading_strategy(
                         }
                         let warmed = current_seq > WARMUP_PACKETS;
                         let halted = order_book.halt.load(Ordering::Relaxed);
-                        let decision = model.on_traded_tick(price, tick_ptr.bid, tick_ptr.ask, tick_ptr.volume, tick_now_ns, warmed, halted);
+                        let decision = model.on_traded_tick(price, tick_ptr.bid, tick_ptr.ask, tick_ptr.mark_price, tick_ptr.funding_rate, tick_ptr.volume, tick_now_ns, warmed, halted);
 
                         // Expose the signal: latest value, downsampled series, vol.
                         order_book.latest_signal_bits.store(model.latest_signal_bps().to_bits(), Ordering::Relaxed);
