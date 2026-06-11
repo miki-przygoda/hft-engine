@@ -177,6 +177,7 @@ fn main() {
         spread_lo_bits: AtomicU32::new(f32::INFINITY.to_bits()),
         spread_hi_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
         funding_bits:   AtomicU32::new(0f32.to_bits()),
+        funding_quote_bits: AtomicU64::new(0f64.to_bits()),
         target_price,
         target_dip_bps,
         buy_on_downtick,

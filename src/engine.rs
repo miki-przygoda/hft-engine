@@ -1100,6 +1100,9 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
                          s.avg_win_bps, s.avg_loss_bps, s.profit_factor);
                 println!("Max drawdown {:.2} quote ({:.1}%)  |  Sharpe(/trade) {:.2}  |  fees {:.2}  |  spread cost {:.2} bps/trade  |  avg hold {:.1} ms",
                          s.max_drawdown, s.max_dd_pct, s.sharpe, s.total_fees, s.avg_spread_cost_bps, s.avg_hold_ms);
+                let funding_total = f64::from_bits(order_book.funding_quote_bits.load(Ordering::Relaxed));
+                println!("Funding: {:+.4} quote total  ({:+.6} quote/trade)  — a per-hour cost, ≈0 at ms holds; scales with hold time",
+                         funding_total, funding_total / s.n as f64);
                 let verdict = if s.ruined { "BLOWN UP (account ruined)" }
                               else if s.return_pct > 0.0 { "net PROFITABLE" } else { "net LOSS" };
                 println!("→ {verdict} after fees over this run.");
@@ -1362,6 +1365,7 @@ fn write_log(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
                 json.push_str(&format!("    \"gross_bps_mean\": {:.4}, \"net_bps_mean\": {:.4}, \"avg_win_bps\": {:.4}, \"avg_loss_bps\": {:.4},\n",
                     s.gross_bps_mean, s.net_bps_mean, s.avg_win_bps, s.avg_loss_bps));
                 let pf = if s.profit_factor.is_finite() { format!("{:.4}", s.profit_factor) } else { "null".to_string() };
+                json.push_str(&format!("    \"funding_quote\": {:.4},\n", f64::from_bits(order_book.funding_quote_bits.load(Ordering::Relaxed))));
                 json.push_str(&format!("    \"profit_factor\": {}, \"max_drawdown_quote\": {:.4}, \"max_dd_pct\": {:.4}, \"sharpe_per_trade\": {:.4}, \"avg_spread_cost_bps\": {:.4}, \"avg_hold_ms\": {:.3}\n",
                     pf, s.max_drawdown, s.max_dd_pct, s.sharpe, s.avg_spread_cost_bps, s.avg_hold_ms));
             }
@@ -1579,6 +1583,8 @@ pub(crate) unsafe fn trading_strategy(
         let mut pos_side:    i64 = 0;    // 0 flat, +1 long, -1 short
         let mut entry_price: f32 = 0.0;
         let mut entry_mid:   f32 = 0.0;  // mid at entry, for the SP2 spread-cost accounting
+        let mut entry_funding: f32 = 0.0;  // relative funding rate sampled at entry (SP3)
+        let mut total_funding: f64 = 0.0;  // accumulated funding cash flow (SP3)
         let mut entry_time:  u64 = 0;
         let mut pos_size:    f32 = 0.0;
         // Rolling volatility (EMA of |per-tick return| in bps). In adaptive mode the
@@ -1909,6 +1915,8 @@ pub(crate) unsafe fn trading_strategy(
                         let warmed = current_seq > WARMUP_PACKETS;
                         let halted = order_book.halt.load(Ordering::Relaxed);
                         let decision = model.on_traded_tick(price, tick_ptr.bid, tick_ptr.ask, tick_ptr.mark_price, tick_ptr.funding_rate, tick_ptr.volume, tick_now_ns, warmed, halted);
+                        // Keep the OrderBook funding accumulator in sync (SP3 reporting).
+                        order_book.funding_quote_bits.store(model.total_funding_quote.to_bits(), Ordering::Relaxed);
 
                         // Expose the signal: latest value, downsampled series, vol.
                         order_book.latest_signal_bits.store(model.latest_signal_bps().to_bits(), Ordering::Relaxed);
@@ -1995,6 +2003,7 @@ pub(crate) unsafe fn trading_strategy(
                                     // Cross the spread on entry: long buys the ask, short sells the bid.
                                     entry_price  = crate::model::taker_fill(price, tick_ptr.bid, tick_ptr.ask, dir == 1, tcfg.slippage_bps);
                                     entry_mid    = price;
+                                    entry_funding = if tcfg.funding_bps_per_hr != 0.0 { tcfg.funding_bps_per_hr / 10_000.0 } else { tick_ptr.funding_rate };
                                     pos_size     = (notional / entry_price as f64) as f32;  // units
                                     entry_time   = tick_now_ns;
                                     pos_side     = dir;
@@ -2006,7 +2015,9 @@ pub(crate) unsafe fn trading_strategy(
                                 let move_bps = (price - entry_price) / entry_price
                                     * 10_000.0 * pos_side as f32;
                                 let opp        = if pos_side == 1 { short_sig } else { long_sig };
-                                let liquidated = move_bps <= -liq_bps;
+                                // Perp liquidation is on the MARK price (SP3); fall back to mid if absent.
+                                let mark_move  = if tick_ptr.mark_price > 0.0 { (tick_ptr.mark_price - entry_price) / entry_price * 10_000.0 * pos_side as f32 } else { move_bps };
+                                let liquidated = mark_move <= -liq_bps;
                                 if move_bps >= tp_bps || move_bps <= -sl_bps || opp || liquidated {
                                     // Cross the spread on exit: long sells the bid, short buys the ask.
                                     // move_bps (mid-marked) drove the triggers; realized gross is fill-to-fill.
@@ -2016,8 +2027,12 @@ pub(crate) unsafe fn trading_strategy(
                                     let spread_cost = (((price - entry_mid) / entry_mid * 10_000.0 * pos_side as f32) as f64 - gross_bps) as f32;
                                     let notional   = entry_margin * tcfg.leverage as f64;
                                     let fees_quote = notional * (2.0 * tcfg.fee_bps as f64 / 10_000.0);
+                                    // Funding accrued over the hold (SP3): positive rate → a long pays.
+                                    let funding_q  = crate::model::funding_flow(notional, entry_funding, tick_now_ns.saturating_sub(entry_time), pos_side);
+                                    total_funding += funding_q;
+                                    order_book.funding_quote_bits.store(total_funding.to_bits(), Ordering::Relaxed);
                                     // Isolated margin: a loss can't exceed the posted margin.
-                                    let raw_pnl    = notional * (gross_bps / 10_000.0) - fees_quote;
+                                    let raw_pnl    = notional * (gross_bps / 10_000.0) - fees_quote + funding_q;
                                     let pnl_quote  = raw_pnl.max(-entry_margin);
                                     let was_liq    = liquidated || raw_pnl <= -entry_margin;
 
@@ -2039,7 +2054,7 @@ pub(crate) unsafe fn trading_strategy(
                                     rt.exit_price    = exit_fill;
                                     rt.size          = pos_size;
                                     rt.gross_bps     = gross_bps as f32;
-                                    rt.net_bps       = (gross_bps - 2.0 * tcfg.fee_bps as f64) as f32;
+                                    rt.net_bps       = (gross_bps - 2.0 * tcfg.fee_bps as f64 + funding_q / notional * 10_000.0) as f32;
                                     rt.pnl_quote     = pnl_quote as f32;
                                     rt.fees_quote    = fees_quote as f32;
                                     rt.flags         = if was_liq { 1.0 } else { 0.0 };

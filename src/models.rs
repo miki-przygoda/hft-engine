@@ -264,6 +264,7 @@ pub(crate) struct OrderBook {
     pub(crate) spread_lo_bits: AtomicU32,       // min observed spread (f32 bps bits); sole writer: ingestor
     pub(crate) spread_hi_bits: AtomicU32,       // max observed spread (f32 bps bits); sole writer: ingestor
     pub(crate) funding_bits:   AtomicU32,       // latest funding rate (f32 bits); sole writer: ingestor
+    pub(crate) funding_quote_bits: AtomicU64,   // SP3: accumulated funding cash flow (f64 bits); sole writer: strategy
     // Target-price buy level, set once by main from HFT_TARGET_PRICE. 0.0 = breakout mode.
     pub(crate) target_price:  f32,
     // Relative-dip threshold in bps (HFT_TARGET_DIP_BPS). >0 = buy on a dip of this
