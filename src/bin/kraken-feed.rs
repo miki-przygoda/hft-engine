@@ -917,7 +917,7 @@ mod tests {
         assert!((trades[0].1 + 0.15850568).abs() < 1e-6);   // sell → negative signed volume
         assert_eq!(trades[0].2, 1_534_614_057_321_597_000);
         assert!((trades[1].0 - 5541.3).abs() < 0.01);
-        assert!((trades[1].1 - 0.10000000).abs() < 1e-6);   // buy → positive
+        assert!((trades[1].1 - 0.1).abs() < 1e-6);   // buy → positive
     }
 
     #[test]
