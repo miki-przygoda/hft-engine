@@ -238,7 +238,11 @@ pub(crate) struct MarketTick {
     pub(crate) timestamp:      u64,  // offset 16 — ingest time (ns since engine start)
     pub(crate) origin_ts_ns:   u64,  // offset 24 — exchange trade time (ns since epoch)
     pub(crate) transit_est_ns: u64,  // offset 32 — RTT/2 one-way transit estimate
-    _unused: [u8; 20],               // padding to 64 bytes
+    pub(crate) bid:            f32,  // offset 40 — best bid (v4 futures feed; 0 otherwise)
+    pub(crate) ask:            f32,  // offset 44 — best ask (v4)
+    pub(crate) mark_price:     f32,  // offset 48 — perp mark price (v4)
+    pub(crate) funding_rate:   f32,  // offset 52 — relative funding rate, per hr (v4)
+    _unused: [u8; 8],                // padding to 64 bytes
 }
 ```
 
