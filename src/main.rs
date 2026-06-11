@@ -82,6 +82,8 @@ fn main() {
         normalize:      std::env::var_os("HFT_NORMALIZE").is_some(),
         slippage_bps:   env_f32("HFT_SLIPPAGE_BPS", rust_hft_software::config::SLIPPAGE_BPS_DEFAULT),
         funding_bps_per_hr: env_f32("HFT_FUNDING_BPS_PER_HR", rust_hft_software::config::FUNDING_BPS_PER_HR_DEFAULT),
+        vol_target_bps:    env_f32("HFT_VOL_TARGET_BPS",    rust_hft_software::config::VOL_TARGET_BPS_DEFAULT),
+        max_exposure_mult: env_f32("HFT_MAX_EXPOSURE_MULT", rust_hft_software::config::MAX_EXPOSURE_MULT_DEFAULT),
     };
 
     if trade_cfg.enabled && trade_cfg.momentum {

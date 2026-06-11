@@ -197,6 +197,9 @@ pub(crate) struct TradeCfg {
     // Funding (SP3): manual relative funding-rate override in bps/hr for offline
     // testing; 0 = use the feed's per-tick relative_funding_rate.
     pub funding_bps_per_hr: f32,
+    // Smarter sizing (SP5, both opt-in / default 0 = current conviction sizing):
+    pub vol_target_bps:   f32,  // size so the stop-loss risks ~this many bps of equity
+    pub max_exposure_mult: f32, // hard cap on notional as a multiple of equity
 }
 
 /// One completed round-trip (entry → exit), the unit of the P&L scorecard.

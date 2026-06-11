@@ -130,6 +130,9 @@ pub mod config {
     // Funding (SP3): manual relative funding-rate override (bps/hr) for offline
     // testing; 0 = use the feed's per-tick relative_funding_rate.
     pub const FUNDING_BPS_PER_HR_DEFAULT: f32 = 0.0;
+    // Smarter sizing (SP5), both opt-in / 0 = current conviction sizing.
+    pub const VOL_TARGET_BPS_DEFAULT:    f32 = 0.0;  // size so the stop risks ~this many bps of equity
+    pub const MAX_EXPOSURE_MULT_DEFAULT: f32 = 0.0;  // hard cap on notional / equity (0 = uncapped)
 
     // ── Learned policy (HFT_MODEL / --train) ─────────────────────────────────
     // A tiny MLP (6→8→1, 65 f32 weights — see model::Policy) supplies the signal

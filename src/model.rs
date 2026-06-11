@@ -96,6 +96,26 @@ pub(crate) fn funding_flow(notional: f64, rel_rate: f32, hold_ns: u64, side: i64
     -(side as f64) * notional * rel_rate as f64 * hours
 }
 
+/// Position sizing (SP5). Returns `(notional, margin)` where `margin = notional /
+/// leverage`. Default (`vol_target_bps == 0`) is the existing conviction sizing:
+/// `notional = equity · risk · leverage`. When `vol_target_bps > 0`, size so that a
+/// stop-loss of `sl_bps` risks ≈`vol_target_bps` of equity: `notional = equity ·
+/// vol_target_bps / sl_bps` (leverage-independent — leverage only sets the margin).
+/// Either way, cap notional at `max_exposure_mult · equity` (0 = uncapped).
+pub(crate) fn sized_notional(
+    equity: f64, risk: f64, leverage: f64, vol_target_bps: f32, sl_bps: f64, max_exposure_mult: f32,
+) -> (f64, f64) {
+    let mut notional = if vol_target_bps > 0.0 && sl_bps > 0.0 {
+        equity * (vol_target_bps as f64 / sl_bps)
+    } else {
+        equity * risk * leverage
+    };
+    if max_exposure_mult > 0.0 {
+        notional = notional.min(max_exposure_mult as f64 * equity);
+    }
+    (notional, notional / leverage.max(1.0))
+}
+
 pub(crate) struct AlphaModel {
     cfg: TradeCfg,
     // Signal EMAs: index 0 = traded instrument, 1 = reference.
@@ -355,5 +375,19 @@ mod tests {
         // Zero rate or zero hold → zero.
         assert_eq!(funding_flow(100_000.0, 0.0, h, 1), 0.0);
         assert_eq!(funding_flow(100_000.0, 0.0001, 0, 1), 0.0);
+    }
+
+    #[test]
+    fn sized_notional_modes() {
+        // Default (vol_target 0): conviction sizing = equity · risk · leverage.
+        let (n, m) = sized_notional(10_000.0, 0.1, 2.0, 0.0, 100.0, 0.0);
+        assert!((n - 2_000.0).abs() < 1e-6, "n={n}");   // 10000·0.1·2
+        assert!((m - 1_000.0).abs() < 1e-6, "m={m}");   // notional / leverage
+        // Vol-target: notional = equity · target/sl (leverage-independent). 50bps / 100bps → 0.5·equity.
+        let (n, _) = sized_notional(10_000.0, 0.1, 2.0, 50.0, 100.0, 0.0);
+        assert!((n - 5_000.0).abs() < 1e-6, "n={n}");
+        // Exposure cap clamps notional at mult·equity (would be 50k, capped at 2·10k).
+        let (n, _) = sized_notional(10_000.0, 1.0, 5.0, 0.0, 100.0, 2.0);
+        assert!((n - 20_000.0).abs() < 1e-6, "n={n}");
     }
 }
