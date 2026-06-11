@@ -86,6 +86,16 @@ pub(crate) fn taker_fill(mid: f32, bid: f32, ask: f32, is_buy: bool, slippage_bp
     if is_buy { base * (1.0 + slip) } else { base * (1.0 - slip) }
 }
 
+/// Funding cash flow accrued over a hold, in quote currency (added to P&L).
+/// `rel_rate` is the per-hour **relative** funding rate (fraction of notional per
+/// hour, as Kraken reports for linear perps). Positive rate → a long PAYS (negative
+/// flow), a short RECEIVES. Continuous accrual: flow = −side · notional · rel_rate ·
+/// (hold_ns / 1 hour). Returns 0 when the rate or hold is zero (non-futures feeds).
+pub(crate) fn funding_flow(notional: f64, rel_rate: f32, hold_ns: u64, side: i64) -> f64 {
+    let hours = hold_ns as f64 / 3_600_000_000_000.0;   // ns → hours
+    -(side as f64) * notional * rel_rate as f64 * hours
+}
+
 pub(crate) struct AlphaModel {
     cfg: TradeCfg,
     // Signal EMAs: index 0 = traded instrument, 1 = reference.
@@ -319,5 +329,20 @@ mod tests {
         assert!((taker_fill(100.0, 0.0, 0.0, false, 10.0) -  99.9).abs() < 1e-3);
         // Spread + slippage stack on entry: ask 100.05, +10bps → ~100.150.
         assert!((taker_fill(100.0, 99.95, 100.05, true, 10.0) - 100.15005).abs() < 1e-2);
+    }
+
+    #[test]
+    fn funding_flow_sign_and_scale() {
+        let h = 3_600_000_000_000u64;                 // 1 hour in ns
+        // $100k notional, 0.0001/hr (1 bp/hr), 1h: long PAYS $10, short RECEIVES $10.
+        assert!((funding_flow(100_000.0, 0.0001, h, 1)  - (-10.0)).abs() < 1e-6);
+        assert!((funding_flow(100_000.0, 0.0001, h, -1) -  (10.0)).abs() < 1e-6);
+        // Negative rate flips: long receives.
+        assert!((funding_flow(100_000.0, -0.0001, h, 1) -  (10.0)).abs() < 1e-6);
+        // Half the hold → half the flow.
+        assert!((funding_flow(100_000.0, 0.0001, h / 2, 1) - (-5.0)).abs() < 1e-6);
+        // Zero rate or zero hold → zero.
+        assert_eq!(funding_flow(100_000.0, 0.0, h, 1), 0.0);
+        assert_eq!(funding_flow(100_000.0, 0.0001, 0, 1), 0.0);
     }
 }
