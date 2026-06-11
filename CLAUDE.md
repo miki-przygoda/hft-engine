@@ -441,14 +441,18 @@ working); the extra 16 carry feed metadata:
 [ 0.. 4] price f32      [ 4.. 8] volume f32 (signed: buy +, sell −)  [ 8..16] sequence u64
 [16..24] origin_ts_ns   (exchange trade time, ns since epoch — informational)
 [24..32] transit_est_ns (RTT/2 one-way transit estimate — the distance metric)
-[  32  ] instrument u8  (v3 only: 0 = traded, 1 = reference — for cross-market)
+[  32  ] instrument u8   (v3+: 0 = traded, 1 = reference — for cross-market)
+[33..49] bid f32, ask f32, mark_price f32, funding_rate f32   (v4 Kraken Futures feed)
 ```
 
 The ingestor parses the extra fields only when it receives ≥ 32 bytes; 16-byte
 packets leave them zero. The **v3 packet (33 bytes)** appends a 1-byte instrument
 id so a second market (the cross-market reference) routes to its own ring buffer;
 < 33-byte packets are instrument 0. `volume` carries *signed* trade volume (buy +,
-sell −) — the order-flow input.
+sell −) — the order-flow input. The **v4 packet (49 bytes)** appends four f32s —
+best bid, ask, mark price, and the (relative, per-hour) funding rate — for the
+Kraken Futures feed. The first 33 bytes stay byte-identical to v3, so the ingestor
+reads the v4 tail only when `amt >= 49` and older senders remain valid (invariant #12).
 
 ### Zero dependencies, TLS by proxy
 
@@ -498,6 +502,27 @@ stunnel docs/stunnel.conf &
 HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
 ./target/release/kraken-feed --live 127.0.0.1:8443 --pair XBT/USD --record recordings/live.krkr
 ```
+
+### Kraken Futures feed (`--futures`)
+
+`--futures PRODUCT` (default `PF_XBTUSD`) streams the Kraken **Futures** public
+`ticker` feed from `futures.kraken.com/ws/v1` — **no authentication** (the
+challenge/sign handshake is only for *private* order feeds; a measurement engine
+never uses it). One subscription delivers best **bid/ask** (the real spread),
+**mark price**, and the **relative funding rate**, hand-parsed from the flat JSON
+ticker into the v4 packet. It needs a third stunnel service → `futures.kraken.com:443`
+(a distinct `[kraken-futures]` section in `docs/stunnel.conf`); `ws_handshake` takes
+the request path (spot `/`, futures `/ws/v1`). The synth emits a synthetic spread +
+funding so the v4 fields are exercised offline with no network.
+
+```bash
+stunnel docs/stunnel.conf &
+HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
+./target/release/kraken-feed --futures PF_XBTUSD --record recordings/futures.krkr
+```
+
+The engine's shutdown report shows the observed spread (bps) and latest funding
+rate; these fields drive the **perpetual cost stack** (next section).
 
 ---
 
@@ -579,6 +604,62 @@ book instead of one-sided buy attempts, and scores its P&L.
 - **Config** (env-overridable; defaults in `config`): `HFT_ENTRY_BPS`, `HFT_TP_BPS`,
   `HFT_SL_BPS`, `HFT_FEE_BPS` (per side), `HFT_LEVERAGE`, `HFT_CAPITAL`,
   `HFT_RISK_FRAC`, `HFT_MAX_SIZE_MULT`, `HFT_USE_FLOW`, `HFT_ADAPTIVE`, `HFT_NO_SHORT`.
+
+---
+
+## Perpetual cost stack (`--futures`)
+
+On the Kraken Futures feed the model charges the **real costs of trading a perp**,
+not just the exchange fee — applied identically in both trade paths (the
+`AlphaModel` momentum path and the inline mean-reversion path) and the backtester,
+and each cost broken out so it can't hide in the net. All of it defaults to
+behavior-preserving on non-futures feeds (no bid/ask → fill at mid; no rate → no
+funding), so the in-process sim and spot replay are unchanged.
+
+### Spread-crossing fills + slippage (`HFT_SLIPPAGE_BPS`)
+
+`model::taker_fill(mid, bid, ask, is_buy, slippage_bps)` crosses the spread: a buy
+(long entry, short cover) fills at the **ask**, a sell (short entry, long exit) at
+the **bid**, plus `HFT_SLIPPAGE_BPS` of extra adverse slippage; it falls back to
+`mid` when there is no quote. The triggers stay mid-marked; realized gross is
+measured **fill-to-fill**, so both half-spreads land in P&L. The scorecard reports
+`spread cost X bps/trade` = the mid-to-mid ideal move minus the realized gross
+(stored per round-trip in `RoundTrip.spread_cost_bps`, which reuses the slot the
+redundant `hold_ns` held — hold time is derived from the entry/exit timestamps).
+
+### Funding accrual (`HFT_FUNDING_BPS_PER_HR`)
+
+`model::funding_flow(notional, rel_rate, hold_ns, side) = −side · notional ·
+rel_rate · hours`. The rate is the feed's **`relative_funding_rate`** (per-hour
+fraction of spot — the directly-usable one; the absolute `funding_rate` is
+USD/contract/hr and needs contract size). Positive rate → a long pays; charged
+continuously over the hold, sampled at entry. At the model's ~20 ms holds funding
+is ≈0 (it's a per-*hour* rate) — it only matters for minute-to-hour holds.
+`HFT_FUNDING_BPS_PER_HR` overrides the rate for offline testing. The aggregate is
+accumulated in `OrderBook.funding_quote_bits` (live) / `AlphaModel.total_funding_quote`
+(backtest) and printed as the `Funding:` line.
+
+### Mark-price liquidation
+
+Liquidation triggers on the perp **mark price** vs entry
+(`(mark − entry)/entry · side ≤ −10000/leverage`), not the mid — the genuine perp
+reference; falls back to mid when `mark` is absent.
+
+### Smarter sizing (`HFT_VOL_TARGET_BPS`, `HFT_MAX_EXPOSURE_MULT`)
+
+`model::sized_notional(equity, risk, leverage, vol_target_bps, sl_bps, max_exposure_mult)`
+is the shared sizing. Default (vol-target 0) is the existing conviction sizing.
+`HFT_VOL_TARGET_BPS` sizes so a stop-loss of `sl_bps` risks ~that many bps of equity
+(`notional = equity · vol_target/sl_bps`) — size *down* when vol is high — **bounded
+by margin capacity** (`notional ≤ equity · leverage`; vol-target can blow past it on
+a tight stop). `HFT_MAX_EXPOSURE_MULT` hard-caps notional at a multiple of equity.
+
+### Richer risk metrics
+
+`scorecard()` (shared by live + backtest) adds **Sortino** (downside-deviation),
+**Calmar** (return ÷ maxDD), **time-in-drawdown** (timestamp-weighted), **turnover**
+(notional ÷ capital), and a **long-vs-short split** (net bps / win-rate / P&L per
+side) — printed as the `Risk:` and `By side:` lines and mirrored in the JSON.
 
 ---
 
