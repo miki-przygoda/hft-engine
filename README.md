@@ -61,7 +61,7 @@ No mutex, no condvar, no blocking synchronisation on the hot path.
 
 ### Cache-line alignment everywhere
 
-Every struct that crosses thread boundaries is `#[repr(C, align(64))]`. `MarketTick` is padded to exactly 64 bytes (`_unused: [u8; 36]`) — one tick per cache line, no false sharing, no partial-line loads.
+Every struct that crosses thread boundaries is `#[repr(C, align(64))]`. `MarketTick` is exactly 64 bytes — price/volume/sequence/timestamps plus the live-feed fields (bid/ask, mark price, funding rate) and 8 bytes of padding — one tick per cache line, no false sharing, no partial-line loads.
 
 **`start_time` is co-located with `latest_idx` in `RingBuffer`.** The strategy spin-poll loads `latest_idx` on every iteration; `start_time` at +8 bytes sits in the same cache line and is always L1-hot for free. This eliminates the timestamp cold-start penalty without any extra memory traffic.
 
@@ -284,17 +284,21 @@ HFT_TRADE=1 HFT_ADAPTIVE=1 make replay
 HFT_TRADE=1 HFT_ADAPTIVE=1 HFT_FEE_BPS=0 make replay   # isolate the gross edge
 ```
 
-On the realistic (trending) synth, mean-reversion *fights the drift*: gross hit rate ≈45%, and the edge is **negative even before fees** (gross −2.4 bps/trade) — a realistic ~5 bps round-trip fee only deepens it. The backtest sweep makes it undeniable: every fixed-weight config is negative out-of-sample (best −0.44%), and z-scoring the signal is what claws the best one barely positive (+0.04%, see below). That's the point: micro mean-reversion is a negative-edge game once you pay to cross the spread — the scorecard reports it honestly rather than hiding it.
+On the realistic (trending) synth, mean-reversion *fights the drift*: gross hit rate ≈38%, and the edge is **negative even before fees** — gross −4.2 bps/trade, of which ~1.5 bps is just crossing the bid/ask spread. A realistic ~5 bps round-trip fee deepens it to −9.4. The scorecard now accounts for the **full perpetual cost stack** — bid/ask spread, slippage, funding, and mark-price liquidation — and breaks out each cost so nothing hides: micro mean-reversion is a negative-edge game once you pay to trade.
 
 ```
 TRADING SCORECARD  (long&short mean-reversion, ADAPTIVE (entry 1σ/TP 1.5σ/SL 2.5σ), 1x lev, 2.6 bps/side fee)
 Observed price range: [54325.97, 60041.45]  (1052.1 bps span)  |  volatility ~2.61 bps/tick
-Round-trips: 493  (323 long / 170 short)  |  liquidations 0
-Hit rate (signal accuracy, gross): 45.0% (222/493)   |   net-win rate (after fees): 23.1% (114W/379L)
-Capital 10000.00 → equity 8693.06   (-13.07% return on capital)
-Net P&L: -1306.94 quote   (gross -2.43 bps/trade, net -7.63 bps/trade after fees)
-Avg win +1.41 bps  |  avg loss -10.35 bps  |  profit factor 0.04
-Max drawdown 1307.94 quote (13.1%)  |  Sharpe(/trade) -1.02  |  fees 879.71  |  avg hold 18.6 ms
+Market data: spread 1.50–1.50 bps  |  funding -0.00000988/hr (relative, latest)
+Round-trips: 471  (307 long / 164 short)  |  liquidations 0
+Hit rate (signal accuracy, gross): 38.0% (179/471)   |   net-win rate (after fees): 13.6% (64W/407L)
+Capital 10000.00 → equity 8480.85   (-15.19% return on capital)
+Net P&L: -1519.15 quote   (gross -4.20 bps/trade, net -9.40 bps/trade after fees)
+Avg win +1.28 bps  |  avg loss -11.08 bps  |  profit factor 0.02
+Max drawdown 1520.00 quote (15.2%)  |  Sharpe(/trade) -1.28  |  fees 829.55  |  spread cost 1.50 bps/trade  |  avg hold 19.6 ms
+Funding: +0.0000 quote total  — a per-hour cost, ≈0 at ms holds; scales with hold time
+Risk: Sortino -0.79  |  Calmar -1.00  |  time-in-drawdown 100.0%  |  turnover 159.5x capital
+By side: LONG 307 net -10.25 bps  11.4% win  -1135.87 quote   |   SHORT 164 net -7.80 bps  17.7% win  -383.28 quote
 → net LOSS after fees over this run.
 ```
 
