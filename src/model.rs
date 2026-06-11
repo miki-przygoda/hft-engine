@@ -161,6 +161,7 @@ impl AlphaModel {
 
     /// Process a traded-instrument tick. `warmed` gates trading until past warmup;
     /// `halted` blocks new entries (exits still proceed).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_traded_tick(
         &mut self, price: f32, bid: f32, ask: f32, signed_vol: f32, now_ns: u64, warmed: bool, halted: bool,
     ) -> Decision {
