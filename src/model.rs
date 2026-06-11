@@ -110,6 +110,10 @@ pub(crate) fn sized_notional(
     } else {
         equity * risk * leverage
     };
+    // Hard margin-capacity bound: you can't post more margin than equity, so
+    // notional ≤ equity · leverage. (Conviction sizing already satisfies this;
+    // vol-target can blow past it on a tight stop.)
+    notional = notional.min(equity * leverage.max(1.0));
     if max_exposure_mult > 0.0 {
         notional = notional.min(max_exposure_mult as f64 * equity);
     }
@@ -272,8 +276,10 @@ impl AlphaModel {
             let conv = ((s.abs() - self.cfg.signal_thr_bps).max(0.0)
                         / self.cfg.signal_thr_bps.max(0.1) + 1.0).min(self.cfg.max_size_mult) as f64;
             let risk = (self.cfg.risk_frac as f64 * conv).min(1.0);
-            self.entry_margin = self.equity * risk;
-            let notional = self.entry_margin * self.cfg.leverage as f64;
+            // SP5 sizing: vol-target / exposure-cap when set, else conviction sizing.
+            let (notional, margin) = sized_notional(self.equity, risk, self.cfg.leverage as f64,
+                self.cfg.vol_target_bps, self.cfg.sl_bps as f64, self.cfg.max_exposure_mult);
+            self.entry_margin = margin;
             // Cross the spread on entry: a long buys the ask, a short sells the bid.
             self.entry_price = taker_fill(price, bid, ask, dir == 1, self.cfg.slippage_bps);
             self.entry_mid  = price;
@@ -388,6 +394,10 @@ mod tests {
         assert!((n - 5_000.0).abs() < 1e-6, "n={n}");
         // Exposure cap clamps notional at mult·equity (would be 50k, capped at 2·10k).
         let (n, _) = sized_notional(10_000.0, 1.0, 5.0, 0.0, 100.0, 2.0);
+        assert!((n - 20_000.0).abs() < 1e-6, "n={n}");
+        // Vol-target bounded by margin capacity: 50bps/5bps wants 10·equity, but at
+        // 2× leverage the hard cap is equity·leverage = 2·equity.
+        let (n, _) = sized_notional(10_000.0, 0.1, 2.0, 50.0, 5.0, 0.0);
         assert!((n - 20_000.0).abs() < 1e-6, "n={n}");
     }
 }

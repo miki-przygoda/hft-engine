@@ -2045,8 +2045,10 @@ pub(crate) unsafe fn trading_strategy(
                                     let depth_mult = ((depth_frac * 10_000.0) / entry_bps.max(VOL_FLOOR))
                                                      .clamp(1.0, tcfg.max_size_mult) as f64;
                                     let risk     = (tcfg.risk_frac as f64 * depth_mult).min(1.0);
-                                    entry_margin = equity * risk;
-                                    let notional = entry_margin * tcfg.leverage as f64;
+                                    // SP5 sizing: vol-target / exposure-cap when set, else conviction sizing.
+                                    let (notional, margin) = crate::model::sized_notional(equity, risk,
+                                        tcfg.leverage as f64, tcfg.vol_target_bps, sl_bps as f64, tcfg.max_exposure_mult);
+                                    entry_margin = margin;
                                     // Cross the spread on entry: long buys the ask, short sells the bid.
                                     entry_price  = crate::model::taker_fill(price, tick_ptr.bid, tick_ptr.ask, dir == 1, tcfg.slippage_bps);
                                     entry_mid    = price;
