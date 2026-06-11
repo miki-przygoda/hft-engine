@@ -191,6 +191,9 @@ pub(crate) struct TradeCfg {
     pub fee_gate:        bool, // require expected move ≥ round-trip cost + min_edge
     pub min_edge_bps:    f32,  // edge buffer over cost for the fee gate
     pub normalize:       bool, // z-score the composite-signal terms
+    // Realistic fills (SP2): entries/exits cross the real bid/ask spread; this adds
+    // extra adverse slippage in bps on top of the spread (0 = spread only).
+    pub slippage_bps:    f32,
 }
 
 /// One completed round-trip (entry → exit), the unit of the P&L scorecard.

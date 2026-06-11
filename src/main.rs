@@ -80,6 +80,7 @@ fn main() {
         fee_gate:       std::env::var_os("HFT_FEE_GATE").is_some(),
         min_edge_bps:   env_f32("HFT_MIN_EDGE_BPS", rust_hft_software::config::MIN_EDGE_BPS_DEFAULT),
         normalize:      std::env::var_os("HFT_NORMALIZE").is_some(),
+        slippage_bps:   env_f32("HFT_SLIPPAGE_BPS", rust_hft_software::config::SLIPPAGE_BPS_DEFAULT),
     };
 
     if trade_cfg.enabled && trade_cfg.momentum {

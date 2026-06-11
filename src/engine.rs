@@ -641,7 +641,7 @@ fn scorecard(rts: &[models::RoundTrip], capital: f64) -> Option<Scorecard> {
 // in-sample/out-of-sample split and a small parameter grid, ranked by OOS return.
 
 #[derive(Copy, Clone)]
-struct BtTick { id: u8, price: f32, vol: f32, t_ns: u64 }
+struct BtTick { id: u8, price: f32, vol: f32, t_ns: u64, bid: f32, ask: f32 }
 
 fn load_capture(path: &str) -> std::io::Result<Vec<BtTick>> {
     let data = std::fs::read(path)?;
@@ -663,6 +663,9 @@ fn load_capture(path: &str) -> std::io::Result<Vec<BtTick>> {
             price: f32::from_le_bytes(pkt[0..4].try_into().unwrap()),
             vol:   f32::from_le_bytes(pkt[4..8].try_into().unwrap()),
             t_ns:  t,
+            // v4 packets (>= 49 bytes) carry bid/ask at [33..41]; older packets 0.
+            bid:   if len >= 49 { f32::from_le_bytes(pkt[33..37].try_into().unwrap()) } else { 0.0 },
+            ask:   if len >= 49 { f32::from_le_bytes(pkt[37..41].try_into().unwrap()) } else { 0.0 },
         });
     }
     Ok(out)
@@ -682,7 +685,7 @@ fn run_model(
         seq += 1;
         let warmed = seq > WARMUP_PACKETS;
         if let crate::model::Decision::Exit(rt) =
-            model.on_traded_tick(tk.price, tk.vol, tk.t_ns, warmed, false)
+            model.on_traded_tick(tk.price, tk.bid, tk.ask, tk.vol, tk.t_ns, warmed, false)
         {
             rts.push(rt);
         }
@@ -1897,7 +1900,7 @@ pub(crate) unsafe fn trading_strategy(
                         }
                         let warmed = current_seq > WARMUP_PACKETS;
                         let halted = order_book.halt.load(Ordering::Relaxed);
-                        let decision = model.on_traded_tick(price, tick_ptr.volume, tick_now_ns, warmed, halted);
+                        let decision = model.on_traded_tick(price, tick_ptr.bid, tick_ptr.ask, tick_ptr.volume, tick_now_ns, warmed, halted);
 
                         // Expose the signal: latest value, downsampled series, vol.
                         order_book.latest_signal_bits.store(model.latest_signal_bps().to_bits(), Ordering::Relaxed);

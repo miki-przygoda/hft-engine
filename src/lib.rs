@@ -124,6 +124,9 @@ pub mod config {
     // Fee-aware entry gate (HFT_FEE_GATE=1): require expected move ≥ round-trip
     // cost + this buffer before entering. Kills structurally-doomed trades.
     pub const MIN_EDGE_BPS_DEFAULT: f32 = 0.0;
+    // Realistic fills (SP2): extra adverse slippage in bps on top of the crossed
+    // bid/ask spread (HFT_SLIPPAGE_BPS). 0 = spread only.
+    pub const SLIPPAGE_BPS_DEFAULT: f32 = 0.0;
 
     // ── Learned policy (HFT_MODEL / --train) ─────────────────────────────────
     // A tiny MLP (6→8→1, 65 f32 weights — see model::Policy) supplies the signal

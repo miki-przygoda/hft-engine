@@ -161,7 +161,7 @@ impl AlphaModel {
     /// Process a traded-instrument tick. `warmed` gates trading until past warmup;
     /// `halted` blocks new entries (exits still proceed).
     pub(crate) fn on_traded_tick(
-        &mut self, price: f32, signed_vol: f32, now_ns: u64, warmed: bool, halted: bool,
+        &mut self, price: f32, bid: f32, ask: f32, signed_vol: f32, now_ns: u64, warmed: bool, halted: bool,
     ) -> Decision {
         // Own EMAs, order flow, volatility.
         if self.ema_init[0] {
@@ -238,11 +238,12 @@ impl AlphaModel {
             let risk = (self.cfg.risk_frac as f64 * conv).min(1.0);
             self.entry_margin = self.equity * risk;
             let notional = self.entry_margin * self.cfg.leverage as f64;
-            self.pos_size   = (notional / price as f64) as f32;
-            self.entry_price = price;
+            // Cross the spread on entry: a long buys the ask, a short sells the bid.
+            self.entry_price = taker_fill(price, bid, ask, dir == 1, self.cfg.slippage_bps);
+            self.pos_size   = (notional / self.entry_price as f64) as f32;
             self.entry_time = now_ns;
             self.pos_side = dir;
-            self.best_price = price;
+            self.best_price = price;   // mark at mid for the trailing stop
             Decision::Enter { side: dir, signal_bps: s }
         } else {
             if self.pos_side == 1 { if price > self.best_price { self.best_price = price; } }
@@ -261,7 +262,11 @@ impl AlphaModel {
             let sl_hit = self.cfg.sl_bps > 0.0 && move_bps <= -self.cfg.sl_bps;
             if !(trail_hit || flip || tp_hit || sl_hit || liquidated) { return Decision::None; }
 
-            let gross_bps  = move_bps as f64;
+            // Cross the spread on exit: a long sells the bid, a short buys the ask.
+            // move_bps (mid-marked) drove the triggers above; the realized gross is
+            // measured fill-to-fill, so both half-spreads land in the P&L.
+            let exit_fill  = taker_fill(price, bid, ask, self.pos_side == -1, self.cfg.slippage_bps);
+            let gross_bps  = ((exit_fill - self.entry_price) / self.entry_price * 10_000.0 * self.pos_side as f32) as f64;
             let notional   = self.entry_margin * self.cfg.leverage as f64;
             let rt_fee     = self.round_trip_fee_bps() as f64;
             let fees_quote = notional * (rt_fee / 10_000.0);
@@ -278,7 +283,7 @@ impl AlphaModel {
                 hold_ns: now_ns.saturating_sub(self.entry_time),
                 side,
                 entry_price: self.entry_price,
-                exit_price: price,
+                exit_price: exit_fill,
                 size: self.pos_size,
                 gross_bps: gross_bps as f32,
                 net_bps: (gross_bps - rt_fee) as f32,
