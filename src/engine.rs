@@ -1984,8 +1984,9 @@ pub(crate) unsafe fn trading_strategy(
                                     let risk     = (tcfg.risk_frac as f64 * depth_mult).min(1.0);
                                     entry_margin = equity * risk;
                                     let notional = entry_margin * tcfg.leverage as f64;
-                                    pos_size     = (notional / price as f64) as f32;  // units
-                                    entry_price  = price;
+                                    // Cross the spread on entry: long buys the ask, short sells the bid.
+                                    entry_price  = crate::model::taker_fill(price, tick_ptr.bid, tick_ptr.ask, dir == 1, tcfg.slippage_bps);
+                                    pos_size     = (notional / entry_price as f64) as f32;  // units
                                     entry_time   = tick_now_ns;
                                     pos_side     = dir;
                                     order_book.net_position.fetch_add(dir, Ordering::Relaxed);
@@ -1998,7 +1999,10 @@ pub(crate) unsafe fn trading_strategy(
                                 let opp        = if pos_side == 1 { short_sig } else { long_sig };
                                 let liquidated = move_bps <= -liq_bps;
                                 if move_bps >= tp_bps || move_bps <= -sl_bps || opp || liquidated {
-                                    let gross_bps  = move_bps as f64;
+                                    // Cross the spread on exit: long sells the bid, short buys the ask.
+                                    // move_bps (mid-marked) drove the triggers; realized gross is fill-to-fill.
+                                    let exit_fill  = crate::model::taker_fill(price, tick_ptr.bid, tick_ptr.ask, pos_side == -1, tcfg.slippage_bps);
+                                    let gross_bps  = ((exit_fill - entry_price) / entry_price * 10_000.0 * pos_side as f32) as f64;
                                     let notional   = entry_margin * tcfg.leverage as f64;
                                     let fees_quote = notional * (2.0 * tcfg.fee_bps as f64 / 10_000.0);
                                     // Isolated margin: a loss can't exceed the posted margin.
@@ -2021,7 +2025,7 @@ pub(crate) unsafe fn trading_strategy(
                                     rt.hold_ns       = tick_now_ns.saturating_sub(entry_time);
                                     rt.side          = pos_side;
                                     rt.entry_price   = entry_price;
-                                    rt.exit_price    = price;
+                                    rt.exit_price    = exit_fill;
                                     rt.size          = pos_size;
                                     rt.gross_bps     = gross_bps as f32;
                                     rt.net_bps       = (gross_bps - 2.0 * tcfg.fee_bps as f64) as f32;
