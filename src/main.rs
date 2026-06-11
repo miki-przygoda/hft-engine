@@ -112,6 +112,26 @@ fn main() {
         println!("[engine] target-price mode: buy when price ≤ {target_price}");
     }
 
+    // Perpetual cost stack (SP2–SP5): only echo the knobs that are actually engaged,
+    // so a plain run stays quiet but a cost-aware run is self-documenting.
+    if trade_cfg.slippage_bps != 0.0 || trade_cfg.funding_bps_per_hr != 0.0
+        || trade_cfg.vol_target_bps != 0.0 || trade_cfg.max_exposure_mult != 0.0 {
+        let mut parts: Vec<String> = Vec::new();
+        if trade_cfg.slippage_bps != 0.0 {
+            parts.push(format!("slippage {:.2}bps", trade_cfg.slippage_bps));
+        }
+        if trade_cfg.funding_bps_per_hr != 0.0 {
+            parts.push(format!("funding {:.2}bps/hr", trade_cfg.funding_bps_per_hr));
+        }
+        if trade_cfg.vol_target_bps != 0.0 {
+            parts.push(format!("vol-target {:.1}bps (size↓ as σ↑)", trade_cfg.vol_target_bps));
+        }
+        if trade_cfg.max_exposure_mult != 0.0 {
+            parts.push(format!("exposure ≤ {:.1}×equity", trade_cfg.max_exposure_mult));
+        }
+        println!("[engine] cost stack: {}", parts.join("  "));
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     // Train a learned policy (CEM) over a capture and write it to HFT_MODEL, then
