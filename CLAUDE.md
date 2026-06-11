@@ -881,7 +881,8 @@ are behind `#[cfg(target_os = "linux")]`.
 ## Roadmap — what isn't here yet
 
 1. **Real market data feed** — *partially delivered:* the `kraken-feed` adapter
-   brings live Kraken trades in over UDP (see *Live data feed*). Next: kernel-bypass
+   brings live Kraken **spot trades** and **Futures perp ticker** (`--futures`:
+   real spread/mark/funding) in over UDP (see *Live data feed*). Next: kernel-bypass
    networking (AF_XDP / DPDK) and multicast reception (e.g. CME MDP 3.0), keeping
    the single-writer-per-`latest_idx` invariant. Consider one `RingBuffer` per
    instrument (the scaffold is in place).
@@ -893,8 +894,11 @@ are behind `#[cfg(target_os = "linux")]`.
 3. **Real order submission** — drain the `OrderRing` to FIX / OUCH / an
    exchange-native binary protocol over a real NIC from a dedicated submission
    thread (the ring already has the right shape).
-4. **Deeper risk & position management** — richer limits, drawdown kill switches,
-   and full sequence-gap recovery.
+4. **Deeper risk & position management** — *partially delivered:* the perpetual
+   cost stack adds mark-price liquidation, vol-target sizing + exposure caps, and
+   richer risk metrics (Sortino / Calmar / time-in-drawdown / turnover / per-side;
+   see *Perpetual cost stack*). Next: drawdown kill switches, portfolio-level
+   limits, and full sequence-gap recovery.
 5. **Multi-instrument** — wire up `InstrumentBuffers` beyond slot 0.
 
 ---
@@ -934,8 +938,10 @@ a quick test.
     Empirically ~42× slower and unit-fragile.
 12. **Market-data packets are versioned and back-compatible.** Legacy = 16 bytes,
     v2 = 32 (adds `origin_ts_ns`/`transit_est_ns`), v3 = 33 (adds a 1-byte
-    `instrument` id at [32]). The ingestor parses each tier by `amt`; old senders
-    stay valid and route to instrument 0.
+    `instrument` id at [32]), v4 = 49 (adds `bid`/`ask`/`mark_price`/`funding_rate`
+    as 4×f32 at [33..49], for the Futures feed). The ingestor parses each tier by
+    `amt`; each version's leading bytes are byte-identical to the prior one, so old
+    senders stay valid and route to instrument 0.
 13. **stunnel terminates TLS externally; `kraken-feed` is plaintext TCP.** The
     adapter speaks WebSocket by hand and never links a TLS library — this is what
     keeps the workspace zero-dependency while consuming a `wss://` feed.
