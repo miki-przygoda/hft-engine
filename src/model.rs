@@ -72,6 +72,20 @@ pub(crate) enum Decision {
     Exit(RoundTrip),
 }
 
+/// Taker fill price: a buy crosses up to the **ask**, a sell crosses down to the
+/// **bid**, plus `slippage_bps` of extra adverse slippage (book-walking / impact).
+/// Falls back to `mid` when there is no usable quote (bid/ask are 0 or degenerate,
+/// e.g. the spot trade feed or legacy v1–v3 packets), so non-v4 feeds keep filling
+/// at the observed price — SP2 spread cost applies only where a real spread exists.
+pub(crate) fn taker_fill(mid: f32, bid: f32, ask: f32, is_buy: bool, slippage_bps: f32) -> f32 {
+    let have_quote = bid > 0.0 && ask >= bid;
+    let base = if is_buy {
+        if have_quote { ask } else { mid }
+    } else if have_quote { bid } else { mid };
+    let slip = slippage_bps / 10_000.0;
+    if is_buy { base * (1.0 + slip) } else { base * (1.0 - slip) }
+}
+
 pub(crate) struct AlphaModel {
     cfg: TradeCfg,
     // Signal EMAs: index 0 = traded instrument, 1 = reference.
@@ -273,5 +287,26 @@ impl AlphaModel {
                 flags: if was_liq { 1.0 } else { 0.0 },
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn taker_fill_crosses_spread() {
+        // Buy crosses to the ask; sell crosses to the bid.
+        assert_eq!(taker_fill(100.0, 99.95, 100.05, true, 0.0), 100.05);
+        assert_eq!(taker_fill(100.0, 99.95, 100.05, false, 0.0), 99.95);
+        // No usable quote (bid/ask 0, or ask<bid) → fall back to mid.
+        assert_eq!(taker_fill(100.0, 0.0, 0.0, true, 0.0), 100.0);
+        assert_eq!(taker_fill(100.0, 0.0, 0.0, false, 0.0), 100.0);
+        assert_eq!(taker_fill(100.0, 101.0, 99.0, true, 0.0), 100.0); // crossed quote → mid
+        // Slippage is adverse: buys fill higher, sells lower (10 bps).
+        assert!((taker_fill(100.0, 0.0, 0.0, true,  10.0) - 100.1).abs() < 1e-3);
+        assert!((taker_fill(100.0, 0.0, 0.0, false, 10.0) -  99.9).abs() < 1e-3);
+        // Spread + slippage stack on entry: ask 100.05, +10bps → ~100.150.
+        assert!((taker_fill(100.0, 99.95, 100.05, true, 10.0) - 100.15005).abs() < 1e-2);
     }
 }
