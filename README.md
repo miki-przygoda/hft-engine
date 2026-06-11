@@ -198,7 +198,7 @@ src/
 ├── bin/
 │   ├── fake-exchange.rs         # Standalone spin-poll UDP exchange (external round-trip measurement)
 │   ├── market-simulator.rs      # Standalone UDP packet sender
-│   └── kraken-feed.rs           # Live Kraken feed adapter (hand-rolled WebSocket, RTT, record/replay)
+│   └── kraken-feed.rs           # Kraken spot + futures feed adapter (hand-rolled WebSocket, RTT, record/replay/synth)
 └── testing_scripts/
     ├── one_threaded.rs          # Single-threaded SIMD throughput benchmark
     └── multi_threaded.rs        # All-core Apple Silicon stress test ("The Kraken")
@@ -234,6 +234,16 @@ HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
 ```
 
 On Linux, prefix the engine with `sudo` (or `SUDO=sudo make live`) for `SCHED_FIFO` + affinity (`CAP_SYS_NICE`).
+
+**Kraken Futures (perpetuals).** `--futures` streams the public Futures `ticker` feed (`futures.kraken.com`, **no auth** — only private order feeds need signing) for a perp like `PF_XBTUSD`, carrying **real bid/ask spread, mark price, and funding rate**. These are the inputs for honest perpetual cost accounting (see [Realistic perpetual costs](#realistic-perpetual-costs-spread-funding-mark-sizing)). Needs a third stunnel service → `futures.kraken.com:443` (in `docs/stunnel.conf`):
+
+```bash
+stunnel docs/stunnel.conf &
+HFT_EXTERNAL_FEED=1 ./target/release/trading-engine &
+./target/release/kraken-feed --futures PF_XBTUSD --record recordings/futures.krkr
+```
+
+The engine's market block then reports the observed spread (bps) and live funding rate. The adapter packs them into a 49-byte **v4 packet** (the first 33 bytes byte-identical to the spot v3 packet, so older senders stay valid).
 
 **Historical data (longer sessions).** To backtest a real multi-hour "day" without waiting, pull historical trades from Kraken's REST API (needs a second stunnel service → `api.kraken.com:443`, see `docs/stunnel.conf`):
 
@@ -311,6 +321,18 @@ HFT_TRADE=1 HFT_ADAPTIVE=1 HFT_USE_FLOW=1 HFT_LEVERAGE=50 \
 ```
 
 Knobs (all env-overridable): `HFT_ENTRY_BPS`, `HFT_TP_BPS`, `HFT_SL_BPS`, `HFT_FEE_BPS` (per side), `HFT_LEVERAGE`, `HFT_CAPITAL`, `HFT_RISK_FRAC`, `HFT_MAX_SIZE_MULT`, `HFT_USE_FLOW`, `HFT_ADAPTIVE`, `HFT_NO_SHORT`. The JSON log gains a `trading` scorecard (capital, final equity, return %, liquidations, ruined), an `equity_curve`, and a `round_trip_log`. **Fees + leverage are the killers** — a sub-bp gross edge that survives at 1× compounds into a blow-up at 50×. See [`CLAUDE.md`](CLAUDE.md#trading-model-hft_trade).
+
+### Realistic perpetual costs (spread, funding, mark, sizing)
+
+On the Kraken Futures feed (`--futures`) the model accounts for the **real costs of trading a perp**, not just the exchange fee — and breaks each one out so nothing hides in the net:
+
+- **Spread-crossing fills.** Entries fill at the **ask**, exits at the **bid** (a long buys the offer and sells the bid; a short mirrors it). The half-spread is paid on each leg and lands in realized P&L. `HFT_SLIPPAGE_BPS` adds extra adverse slippage to model walking the book. The scorecard reports `spread cost X bps/trade`.
+- **Funding accrual.** A held position accrues funding from the feed's `relative_funding_rate` (per-hour): a positive rate means **longs pay shorts**, charged continuously over the hold. At the model's ~20 ms holds funding is ≈0 (it's a per-*hour* rate) — it only bites on minute-to-hour holds. `HFT_FUNDING_BPS_PER_HR` overrides the rate for offline testing.
+- **Mark-price liquidation.** Liquidation triggers on the perp **mark price** vs entry (not the mid) — the genuine perp reference.
+- **Vol-target sizing.** `HFT_VOL_TARGET_BPS` sizes so a stop-loss risks ~N bps of equity (size *down* when volatility is high), bounded by margin capacity (`notional ≤ equity·leverage`). `HFT_MAX_EXPOSURE_MULT` hard-caps notional as a multiple of equity. Both default off — conviction sizing is unchanged.
+- **Richer risk metrics.** The scorecard adds **Sortino**, **Calmar**, **time-in-drawdown** (timestamp-weighted), **turnover** (notional ÷ capital), and a **long-vs-short split** — all in the JSON too.
+
+Everything defaults to **behavior-preserving on non-futures feeds** (no bid/ask → fill at mid; no funding rate → no funding). The offline synth emits a synthetic spread + funding rate, so `make replay` exercises the whole stack deterministically. New knobs: `HFT_SLIPPAGE_BPS`, `HFT_FUNDING_BPS_PER_HR`, `HFT_VOL_TARGET_BPS`, `HFT_MAX_EXPOSURE_MULT`.
 
 ### Trend-following + cross-market signal
 
