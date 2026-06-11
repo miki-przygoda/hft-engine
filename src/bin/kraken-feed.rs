@@ -308,7 +308,10 @@ fn parse_futures_ticker(msg: &str) -> Option<(f32, f32, f32, f32, u64)> {
         return None;
     }
     let mark = json_num(msg, "markPrice").map(|v| v as f32).unwrap_or((bid + ask) / 2.0);
-    let funding = json_num(msg, "funding_rate").map(|v| v as f32).unwrap_or(0.0);
+    // The *relative* funding rate (per-hour fraction of spot) is the directly-usable
+    // one for accrual; the absolute `funding_rate` is USD/contract/hr (needs contract
+    // size). Omitted when zero → 0.0. Positive → longs pay shorts.
+    let funding = json_num(msg, "relative_funding_rate").map(|v| v as f32).unwrap_or(0.0);
     let origin_ns = json_num(msg, "time").map(|ms| (ms as u64).wrapping_mul(1_000_000)).unwrap_or(0);
     Some((bid, ask, mark, funding, origin_ns))
 }
@@ -738,7 +741,7 @@ fn run_futures(
                     let msg = String::from_utf8_lossy(&payload);
                     if let Some((bid, ask, mark, funding, origin_ns)) = parse_futures_ticker(&msg) {
                         if first {
-                            println!("[kraken-feed] first ticker: mid {:.1}  spread {:.3} bps  funding {:.8} (raw)",
+                            println!("[kraken-feed] first ticker: mid {:.1}  spread {:.3} bps  funding {:.8} /hr (relative)",
                                      mid(bid, ask), spread_bps(bid, ask), funding);
                             first = false;
                         }
@@ -962,12 +965,12 @@ mod tests {
 
     #[test]
     fn parse_futures_ticker_message() {
-        let msg = r#"{"feed":"ticker","product_id":"PF_XBTUSD","bid":60234.0,"ask":60235.5,"markPrice":60234.8,"last":60234.5,"funding_rate":1.2e-7,"time":1718040000000}"#;
+        let msg = r#"{"feed":"ticker","product_id":"PF_XBTUSD","bid":60234.0,"ask":60235.5,"markPrice":60234.8,"last":60234.5,"funding_rate":1.2e-7,"relative_funding_rate":3.5e-6,"time":1718040000000}"#;
         let t = parse_futures_ticker(msg).expect("a ticker");
         assert!((t.0 - 60234.0).abs() < 0.01);   // bid
         assert!((t.1 - 60235.5).abs() < 0.01);   // ask
         assert!((t.2 - 60234.8).abs() < 0.01);   // mark
-        assert!((t.3 - 1.2e-7).abs() < 1e-12);   // funding
+        assert!((t.3 - 3.5e-6).abs() < 1e-10);   // relative_funding_rate (not the absolute one)
         assert_eq!(t.4, 1_718_040_000_000_000_000); // time ms → ns
     }
 
