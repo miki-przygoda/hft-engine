@@ -585,6 +585,10 @@ struct Scorecard {
     avg_win_bps: f64, avg_loss_bps: f64,
     profit_factor: f64, max_drawdown: f64, max_dd_pct: f64, sharpe: f64, avg_hold_ms: f64,
     avg_spread_cost_bps: f64,
+    // SP4 risk metrics.
+    sortino: f64, calmar: f64, time_in_dd_pct: f64, turnover: f64,
+    long_net_bps: f64, long_pnl: f64, long_win_rate: f64,
+    short_net_bps: f64, short_pnl: f64, short_win_rate: f64,
     capital: f64, final_equity: f64, return_pct: f64, ruined: bool,
 }
 
@@ -599,13 +603,31 @@ fn scorecard(rts: &[models::RoundTrip], capital: f64) -> Option<Scorecard> {
     let (mut win_pnl, mut loss_pnl, mut hold_sum, mut spread_sum) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let (mut equity, mut peak, mut maxdd, mut min_eq) = (capital, capital, 0.0f64, capital);
     let mut nets: Vec<f64> = Vec::with_capacity(n);
+    // SP4 accumulators.
+    let (mut downside_sq, mut notional_sum) = (0.0f64, 0.0f64);
+    let (mut long_wins, mut short_wins) = (0usize, 0usize);
+    let (mut long_net_sum, mut long_pnl_sum, mut short_net_sum, mut short_pnl_sum) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    // Time-in-drawdown: accumulate wall-time spent below the prior equity peak.
+    let (mut underwater_time, mut last_exit_t, mut last_underwater, mut have_prev) = (0.0f64, 0.0f64, false, false);
+    let first_exit_t = rts[0].exit_time_ns as f64;
     for t in rts {
         let net = t.net_bps as f64;
         net_sum += net; gross_sum += t.gross_bps as f64;
         total_pnl += t.pnl_quote as f64; total_fees += t.fees_quote as f64;
         hold_sum += t.exit_time_ns.saturating_sub(t.entry_time_ns) as f64;
         spread_sum += t.spread_cost_bps as f64;
-        if t.side > 0 { longs += 1; } else { shorts += 1; }
+        downside_sq += net.min(0.0).powi(2);
+        notional_sum += t.size as f64 * t.entry_price as f64;
+        // The gap up to this exit was spent at the previous equity state.
+        let exit_t = t.exit_time_ns as f64;
+        if have_prev && last_underwater { underwater_time += exit_t - last_exit_t; }
+        if t.side > 0 {
+            longs += 1; long_net_sum += net; long_pnl_sum += t.pnl_quote as f64;
+            if net > 0.0 { long_wins += 1; }
+        } else {
+            shorts += 1; short_net_sum += net; short_pnl_sum += t.pnl_quote as f64;
+            if net > 0.0 { short_wins += 1; }
+        }
         if t.flags >= 0.5 { liquidations += 1; }
         if t.gross_bps > 0.0 { gross_wins += 1; }   // signal accuracy (before fees)
         if net > 0.0 { wins += 1; win_bps_sum += net; win_pnl += t.pnl_quote as f64; }
@@ -615,10 +637,17 @@ fn scorecard(rts: &[models::RoundTrip], capital: f64) -> Option<Scorecard> {
         if equity > peak { peak = equity; }
         if peak - equity > maxdd { maxdd = peak - equity; }
         if equity < min_eq { min_eq = equity; }
+        last_underwater = equity < peak;
+        last_exit_t = exit_t;
+        have_prev = true;
     }
     let mean = net_sum / n as f64;
     let std = (nets.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64).sqrt();
+    let downside_dev = (downside_sq / n as f64).sqrt();
     let final_equity = (capital + total_pnl).max(0.0);
+    let return_pct = (final_equity - capital) / capital * 100.0;
+    let max_dd_pct = if peak > 0.0 { maxdd / peak * 100.0 } else { 0.0 };
+    let total_time = (last_exit_t - first_exit_t).max(0.0);
     Some(Scorecard {
         n, wins, losses, longs, shorts, liquidations,
         gross_wins, hit_rate: gross_wins as f64 / n as f64 * 100.0,
@@ -629,11 +658,20 @@ fn scorecard(rts: &[models::RoundTrip], capital: f64) -> Option<Scorecard> {
         avg_loss_bps: if losses > 0 { loss_bps_sum / losses as f64 } else { 0.0 },
         profit_factor: if loss_pnl < 0.0 { win_pnl / -loss_pnl }
                        else if win_pnl > 0.0 { f64::INFINITY } else { 0.0 },
-        max_drawdown: maxdd,
-        max_dd_pct: if peak > 0.0 { maxdd / peak * 100.0 } else { 0.0 },
+        max_drawdown: maxdd, max_dd_pct,
         sharpe: if std > 0.0 { mean / std } else { 0.0 },
         avg_hold_ms: hold_sum / n as f64 / 1e6, avg_spread_cost_bps: spread_sum / n as f64,
-        capital, final_equity, return_pct: (final_equity - capital) / capital * 100.0,
+        sortino: if downside_dev > 0.0 { mean / downside_dev } else { 0.0 },
+        calmar: if max_dd_pct > 0.0 { return_pct / max_dd_pct } else { 0.0 },
+        time_in_dd_pct: if total_time > 0.0 { underwater_time / total_time * 100.0 } else { 0.0 },
+        turnover: notional_sum / capital,
+        long_net_bps:  if longs  > 0 { long_net_sum  / longs  as f64 } else { 0.0 },
+        long_pnl: long_pnl_sum,
+        long_win_rate: if longs  > 0 { long_wins  as f64 / longs  as f64 * 100.0 } else { 0.0 },
+        short_net_bps: if shorts > 0 { short_net_sum / shorts as f64 } else { 0.0 },
+        short_pnl: short_pnl_sum,
+        short_win_rate: if shorts > 0 { short_wins as f64 / shorts as f64 * 100.0 } else { 0.0 },
+        capital, final_equity, return_pct,
         ruined: min_eq <= 0.0,
     })
 }
@@ -1103,6 +1141,11 @@ fn print_stats(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
                 let funding_total = f64::from_bits(order_book.funding_quote_bits.load(Ordering::Relaxed));
                 println!("Funding: {:+.4} quote total  ({:+.6} quote/trade)  — a per-hour cost, ≈0 at ms holds; scales with hold time",
                          funding_total, funding_total / s.n as f64);
+                println!("Risk: Sortino {:.2}  |  Calmar {:.2}  |  time-in-drawdown {:.1}%  |  turnover {:.1}x capital",
+                         s.sortino, s.calmar, s.time_in_dd_pct, s.turnover);
+                println!("By side: LONG {} net {:+.2} bps  {:.1}% win  {:+.2} quote   |   SHORT {} net {:+.2} bps  {:.1}% win  {:+.2} quote",
+                         s.longs,  s.long_net_bps,  s.long_win_rate,  s.long_pnl,
+                         s.shorts, s.short_net_bps, s.short_win_rate, s.short_pnl);
                 let verdict = if s.ruined { "BLOWN UP (account ruined)" }
                               else if s.return_pct > 0.0 { "net PROFITABLE" } else { "net LOSS" };
                 println!("→ {verdict} after fees over this run.");
@@ -1366,6 +1409,10 @@ fn write_log(order_book: &models::OrderBook, mem_pre_log: &MemoryStats) {
                     s.gross_bps_mean, s.net_bps_mean, s.avg_win_bps, s.avg_loss_bps));
                 let pf = if s.profit_factor.is_finite() { format!("{:.4}", s.profit_factor) } else { "null".to_string() };
                 json.push_str(&format!("    \"funding_quote\": {:.4},\n", f64::from_bits(order_book.funding_quote_bits.load(Ordering::Relaxed))));
+                json.push_str(&format!("    \"sortino\": {:.4}, \"calmar\": {:.4}, \"time_in_dd_pct\": {:.4}, \"turnover\": {:.4},\n",
+                    s.sortino, s.calmar, s.time_in_dd_pct, s.turnover));
+                json.push_str(&format!("    \"long_net_bps\": {:.4}, \"long_pnl_quote\": {:.4}, \"long_win_rate\": {:.4}, \"short_net_bps\": {:.4}, \"short_pnl_quote\": {:.4}, \"short_win_rate\": {:.4},\n",
+                    s.long_net_bps, s.long_pnl, s.long_win_rate, s.short_net_bps, s.short_pnl, s.short_win_rate));
                 json.push_str(&format!("    \"profit_factor\": {}, \"max_drawdown_quote\": {:.4}, \"max_dd_pct\": {:.4}, \"sharpe_per_trade\": {:.4}, \"avg_spread_cost_bps\": {:.4}, \"avg_hold_ms\": {:.3}\n",
                     pf, s.max_drawdown, s.max_dd_pct, s.sharpe, s.avg_spread_cost_bps, s.avg_hold_ms));
             }
@@ -2102,5 +2149,43 @@ pub(crate) unsafe fn trading_strategy(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A RoundTrip with the fields the scorecard reads; others defaulted.
+    fn rt(side: i64, net_bps: f32, pnl: f32, size: f32, entry_price: f32, entry_t: u64, exit_t: u64) -> models::RoundTrip {
+        models::RoundTrip {
+            entry_time_ns: entry_t, exit_time_ns: exit_t, spread_cost_bps: 0.0,
+            side, entry_price, exit_price: entry_price, size,
+            gross_bps: net_bps, net_bps, pnl_quote: pnl, fees_quote: 0.0, flags: 0.0,
+        }
+    }
+
+    #[test]
+    fn scorecard_risk_metrics() {
+        // capital 100. equity path: 100 → 110 (peak) → 90 (DD) → 95 (still DD).
+        let rts = [
+            rt( 1,  10.0,  10.0, 1.0, 100.0,  50, 100),  // long  win
+            rt(-1, -20.0, -20.0, 1.0, 100.0, 150, 200),  // short loss
+            rt( 1,   5.0,   5.0, 1.0, 100.0, 350, 400),  // long  win
+        ];
+        let s = scorecard(&rts, 100.0).unwrap();
+        // Sortino: mean = -5/3; downside_dev = sqrt((0+400+0)/3) = 11.547 → -0.1443.
+        assert!((s.sortino - (-0.1443)).abs() < 0.01, "sortino={}", s.sortino);
+        // Calmar: return -5%, maxDD 20/110 = 18.18% → -0.275.
+        assert!((s.calmar - (-0.275)).abs() < 0.02, "calmar={}", s.calmar);
+        // Turnover: (100+100+100)/100 = 3.0.
+        assert!((s.turnover - 3.0).abs() < 1e-6, "turnover={}", s.turnover);
+        // Time-in-DD: underwater from exit2→exit3 (200..400) of total exit1→exit3 (100..400) = 200/300.
+        assert!((s.time_in_dd_pct - 66.67).abs() < 0.5, "time_in_dd={}", s.time_in_dd_pct);
+        // Per side: longs 2 (net (10+5)/2=7.5, 100% win); shorts 1 (net -20, 0% win).
+        assert!((s.long_net_bps  - 7.5).abs()   < 1e-6, "long_net={}", s.long_net_bps);
+        assert!((s.long_win_rate - 100.0).abs() < 1e-6, "long_wr={}", s.long_win_rate);
+        assert!((s.short_net_bps - (-20.0)).abs() < 1e-6, "short_net={}", s.short_net_bps);
+        assert!((s.short_win_rate - 0.0).abs()  < 1e-6, "short_wr={}", s.short_win_rate);
     }
 }
